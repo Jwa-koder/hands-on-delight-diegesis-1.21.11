@@ -45,7 +45,8 @@ public final class FabricPlatform implements Platform {
 
     @Override
     public ItemStack cooked(Level level, CookingPotRecipe recipe, List<ItemStack> items) {
-        return recipe.assemble(new RecipeWrapper(slots(items)), level.registryAccess());
+        return com.pockyl.handson_delight.compat.FoodFreshness.prepared(
+                recipe.assemble(new RecipeWrapper(slots(items)), level.registryAccess()), level, items);
     }
 
     /** The pot's slots holding copies of {@code items}, from the first one on. */
