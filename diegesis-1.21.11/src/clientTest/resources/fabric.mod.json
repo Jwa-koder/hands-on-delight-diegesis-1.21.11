@@ -1,0 +1,25 @@
+{
+  "schemaVersion": 1,
+  "id": "diegesis_smoke_test",
+  "version": "1.0.0",
+  "name": "Diegesis isolated client smoke tests",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.pockyl.diegesis.test.StationSmokeTest"
+    ],
+    "client": [
+      "com.pockyl.diegesis.test.StationSmokeTest"
+    ],
+    "fabric-client-gametest": [
+      "com.pockyl.diegesis.test.StationSmokeTest",
+      "com.pockyl.diegesis.test.HandsOnSmokeTest"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.19.5",
+    "fabric-api": "*",
+    "diegesis": "*",
+    "minecraft": "1.21.11"
+  }
+}

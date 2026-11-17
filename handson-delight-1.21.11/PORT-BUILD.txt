@@ -1,0 +1,34 @@
+UNOFFICIAL FABRIC 1.21.11 PORT
+
+This working copy targets Minecraft Java 1.21.11, Fabric Loader 0.20.1,
+Fabric API 0.141.6+1.21.11 and Farmer's Delight Refabricated 3.6.16.
+It requires the matching unofficial Diegesis 1.21.11 port.
+
+Build with JDK 21:
+1. In sibling diegesis-1.21.11, run ./gradlew build.
+2. In this directory, run ./gradlew build.
+The addon uses the sibling library's named development JAR. To use another
+path, pass -PdiegesisDevJar=/absolute/path/to/the-named-dev.jar.
+The root build.gradle/settings.gradle are the active Fabric-only build.
+The upstream common/fabric/neoforge build scripts are retained as source
+reference, but they are not included as Gradle subprojects in this port.
+
+Farmer's Delight is resolved from its official Modrinth Maven release.
+Do not use the earlier stripped compile copy as a runtime dependency.
+No third-party dependency is bundled inside the resulting addon JAR.
+
+The original authors' MIT license and notices are retained in LICENSE and
+the JAR. This is an independent experimental port, not an official release.
+
+Validation limits:
+- Upstream game-test code remains in source but is excluded from the
+  production source set while its 1.21.1 test harness is being migrated.
+- Optional addon integrations were retained in source, but are not yet
+  verified with 1.21.11 versions of those separate mods.
+- EMI has no matching Fabric 1.21.11 release in the checked project; its
+  optional integration was preserved but is not claimed compatible.
+- JEI and REI compilation uses their 1.21.11 APIs; runtime integration has
+  not yet been tested with those optional recipe viewers.
+
+Runtime integration tests and their results are tracked by the parent
+port project; compilation alone does not establish working cooking UI.

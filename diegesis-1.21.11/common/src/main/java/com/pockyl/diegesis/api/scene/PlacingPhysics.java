@@ -1,0 +1,111 @@
+package com.pockyl.diegesis.api.scene;
+
+import com.mojang.serialization.Codec;
+import com.mojang.serialization.MapCodec;
+import com.mojang.serialization.codecs.RecordCodecBuilder;
+import net.minecraft.util.StringRepresentable;
+
+import com.pockyl.diegesis.impl.codec.StrictCodecs;
+
+/**
+ * Items placed freely fall, tip over and push each other as solid things do: one let go of on its edge falls onto a side
+ * unless something holds it up, one put down where another stands shoves it aside, and what stood on an item taken away comes
+ * down. Written as {@code "physics"} inside {@code "placing"}; without it items stand exactly as they are put.
+ *
+ * <p>The grip is exact, the body is physical. The stack in the hand is held by its top: the point held follows the cursor
+ * closely and alone decides where it lands. Below the grip it is a weight: it floats a little over the surface, sways a little
+ * as it is carried and hangs still once the hand stops, and rises onto what it comes near where there is room above. It
+ * disturbs nothing on its way: where it cannot rise, it keeps beside what stands there, so it lands where it is seen (with
+ * {@code hand_pushes} it is solid instead and, swept in fast, knocks things aside). Going to another surface (a shelf, a door's
+ * bin) it hops over in a short arc. Let go of, it drops under the grip and rocks. Things move only when the hand means them
+ * to: items dragged or turned by hand hit what is in their way. Flat items (food icons) stand as they were turned and rock when
+ * bumped, as a roly-poly toy does.
+ *
+ * <p>The player who moves things works it out on their side and sends where everything came to rest; everyone else sees the
+ * items glide there.
+ *
+ * @param gravity     how fast things fall, pixels per second squared
+ * @param friction    0..1, how hard a thing grips what it stands on or touches, as a share of its weight: pushed less than that
+ *                    it stays put, pushed harder it slides and slows down by a little less
+ * @param uprightFlat flat items (an icon: bread, a carrot) keep standing as they were turned and rock back when bumped (up
+ *                    to {@code rock}); false: they are thin rigid cards that fall over
+ * @param rock        degrees a flat item rocks at most when bumped; 0 keeps it rigidly upright
+ * @param flatDepth   pixels of depth a flat item collides with at least; 0: as thin as it is drawn, so it lies on what is under
+ *                    it and stands against its neighbours with nothing between
+ * @param hover       pixels the stack in the hand floats over what is under it; it drops that far when let go
+ * @param carryLag    seconds the point held takes to close half the way to the cursor; 0 follows at once
+ * @param reach       pixels around the stack in the hand within which it rises onto an item
+ * @param climb       pixels per second the stack in the hand rises onto an item it comes near; it comes down faster
+ * @param swing       the stack in the hand hangs from its top and swings as it is carried; false keeps it upright
+ * @param swingAngle  degrees the stack in the hand swings out at most
+ * @param swingCalm   seconds the swing takes to die down once the hand is still
+ * @param hopTime     seconds the stack in the hand takes to hop over to another surface; 0 jumps there at once
+ * @param toss        0..1, how much of the hand's speed a stack let go of while moving keeps (a short slide), and of its turning
+ *                    an item let go of while turned by hand (it spins on); 0 stops each where it is let go
+ * @param handForce   how hard the hand pulls an item it drags or turns (weight times pixels a second squared; weight is size
+ *                    in cubic pixels times density): a heavy thing comes slower, and what does not give way stops it
+ * @param handPushes  the stack in the hand is solid: it rises onto things only when brought up gently and, swept in fast,
+ *                    shoves and tips them; false: it passes them by, keeping beside what it cannot rise onto
+ * @param turnPower   how much quicker an item turns by hand with physics than {@code placing.turn_speed} says
+ * @param fallOff     what may go over an open edge: {@code held} only what the hand drags over it, {@code any} anything
+ *                    pushed or bumped there too
+ * @param maxSpeed    pixels per second a thing moves at most: a push never flings it far
+ * @param bounce      0..0.5, how much of the speed a thing hits something with it bounces back with; 0: it stops dead where it
+ *                    lands or hits, as kitchen things do
+ */
+public record PlacingPhysics(float gravity, float friction, boolean uprightFlat, float rock, float flatDepth, float hover, float carryLag,
+        float reach, float climb, boolean swing, float swingAngle, float swingCalm, float hopTime, float toss, boolean handPushes,
+        float handForce, float turnPower, FallOff fallOff, float maxSpeed, float bounce) {
+    public static final PlacingPhysics DEFAULT = new PlacingPhysics(200.0F, 0.6F, true, 25.0F, 0.0F, 1.5F, 0.035F, 4.0F, 48.0F, true,
+            12.0F, 0.15F, 0.1F, 0.0F, false, 40000.0F, 1.5F, FallOff.ANY, 80.0F, 0.0F);
+
+    /** What may go over an open edge of a surface. */
+    public enum FallOff implements StringRepresentable {
+        /** Only an item the hand drags over the edge and lets go of there. */
+        HELD,
+        /** Anything pushed or bumped over it too. */
+        ANY;
+
+        public static final Codec<FallOff> CODEC = StringRepresentable.fromEnum(FallOff::values);
+
+        @Override
+        public String getSerializedName() {
+            return name().toLowerCase(java.util.Locale.ROOT);
+        }
+    }
+
+    /** The stack in the hand, read as one part: a record codec takes at most 16 fields. */
+    private record Hand(float hover, float carryLag, float reach, float climb, boolean swing, float swingAngle, float swingCalm,
+            float hopTime, float toss, boolean handPushes, float handForce) {
+        static final MapCodec<Hand> MAP_CODEC = RecordCodecBuilder.mapCodec(instance -> instance.group(
+                StrictCodecs.optional(Codec.floatRange(0.0F, 8.0F), "hover", DEFAULT.hover()).forGetter(Hand::hover),
+                StrictCodecs.optional(Codec.floatRange(0.0F, 1.0F), "carry_lag", DEFAULT.carryLag()).forGetter(Hand::carryLag),
+                StrictCodecs.optional(Codec.floatRange(0.0F, 8.0F), "reach", DEFAULT.reach()).forGetter(Hand::reach),
+                StrictCodecs.optional(Codec.floatRange(1.0F, 1000.0F), "climb", DEFAULT.climb()).forGetter(Hand::climb),
+                StrictCodecs.optional(Codec.BOOL, "swing", DEFAULT.swing()).forGetter(Hand::swing),
+                StrictCodecs.optional(Codec.floatRange(0.0F, 60.0F), "swing_angle", DEFAULT.swingAngle()).forGetter(Hand::swingAngle),
+                StrictCodecs.optional(Codec.floatRange(0.1F, 2.0F), "swing_calm", DEFAULT.swingCalm()).forGetter(Hand::swingCalm),
+                StrictCodecs.optional(Codec.floatRange(0.0F, 0.5F), "hop_time", DEFAULT.hopTime()).forGetter(Hand::hopTime),
+                StrictCodecs.optional(Codec.floatRange(0.0F, 1.0F), "toss", DEFAULT.toss()).forGetter(Hand::toss),
+                StrictCodecs.optional(Codec.BOOL, "hand_pushes", DEFAULT.handPushes()).forGetter(Hand::handPushes),
+                StrictCodecs.optional(Codec.floatRange(1000.0F, 10000000.0F), "hand_force", DEFAULT.handForce()).forGetter(Hand::handForce)
+        ).apply(instance, Hand::new));
+    }
+
+    public static final Codec<PlacingPhysics> CODEC = StrictCodecs.record(instance -> instance.group(
+            StrictCodecs.optional(Codec.floatRange(1.0F, 4000.0F), "gravity", DEFAULT.gravity()).forGetter(PlacingPhysics::gravity),
+            StrictCodecs.optional(Codec.floatRange(0.0F, 1.0F), "friction", DEFAULT.friction()).forGetter(PlacingPhysics::friction),
+            StrictCodecs.optional(Codec.BOOL, "upright_flat", DEFAULT.uprightFlat()).forGetter(PlacingPhysics::uprightFlat),
+            StrictCodecs.optional(Codec.floatRange(0.0F, 45.0F), "rock", DEFAULT.rock()).forGetter(PlacingPhysics::rock),
+            StrictCodecs.optional(Codec.floatRange(0.0F, 2.0F), "flat_depth", DEFAULT.flatDepth()).forGetter(PlacingPhysics::flatDepth),
+            Hand.MAP_CODEC.forGetter(physics -> new Hand(physics.hover, physics.carryLag, physics.reach, physics.climb, physics.swing,
+                    physics.swingAngle, physics.swingCalm, physics.hopTime, physics.toss, physics.handPushes, physics.handForce)),
+            StrictCodecs.optional(Codec.floatRange(1.0F, 3.0F), "turn_power", DEFAULT.turnPower()).forGetter(PlacingPhysics::turnPower),
+            StrictCodecs.optional(FallOff.CODEC, "fall_off", DEFAULT.fallOff()).forGetter(PlacingPhysics::fallOff),
+            StrictCodecs.optional(Codec.floatRange(10.0F, 400.0F), "max_speed", DEFAULT.maxSpeed()).forGetter(PlacingPhysics::maxSpeed),
+            StrictCodecs.optional(Codec.floatRange(0.0F, 0.5F), "bounce", DEFAULT.bounce()).forGetter(PlacingPhysics::bounce)
+    ).apply(instance, (gravity, friction, uprightFlat, rock, flatDepth, hand, turnPower, fallOff, maxSpeed, bounce) -> new PlacingPhysics(
+            gravity, friction, uprightFlat, rock, flatDepth, hand.hover(), hand.carryLag(), hand.reach(), hand.climb(), hand.swing(),
+            hand.swingAngle(), hand.swingCalm(), hand.hopTime(), hand.toss(), hand.handPushes(), hand.handForce(), turnPower, fallOff,
+            maxSpeed, bounce)));
+}

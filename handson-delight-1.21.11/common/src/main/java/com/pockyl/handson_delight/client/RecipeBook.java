@@ -1,0 +1,1620 @@
+package com.pockyl.handson_delight.client;
+
+import com.mojang.blaze3d.vertex.PoseStack;
+import com.mojang.blaze3d.vertex.VertexConsumer;
+import net.minecraft.util.Util;
+import net.minecraft.client.Minecraft;
+import net.minecraft.client.gui.Font;
+import net.minecraft.client.renderer.LightTexture;
+import net.minecraft.client.renderer.MultiBufferSource;
+import net.minecraft.client.renderer.rendertype.RenderType;
+import net.minecraft.client.renderer.entity.ItemRenderer;
+import net.minecraft.client.renderer.texture.OverlayTexture;
+import net.minecraft.client.renderer.texture.TextureAtlas;
+import net.minecraft.client.renderer.texture.TextureAtlasSprite;
+import com.pockyl.diegesis.impl.client.model.SceneModel;
+import net.minecraft.client.resources.sounds.SimpleSoundInstance;
+import net.minecraft.network.chat.Component;
+import net.minecraft.network.protocol.game.ServerboundClientCommandPacket;
+import net.minecraft.resources.Identifier;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.stats.Stats;
+import net.minecraft.util.FormattedCharSequence;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.ItemDisplayContext;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.phys.Vec3;
+import org.joml.Matrix3f;
+import org.joml.Matrix4f;
+import org.joml.Quaternionf;
+import org.joml.Vector3f;
+import org.lwjgl.glfw.GLFW;
+
+import com.pockyl.diegesis.api.client.DiegesisClient;
+import com.pockyl.diegesis.api.client.NodePainter;
+import com.pockyl.diegesis.api.client.NodeView;
+import com.pockyl.diegesis.api.client.StationView;
+import com.pockyl.diegesis.api.scene.Transform;
+import com.pockyl.handson_delight.Cookable;
+import com.pockyl.handson_delight.HandsOnConfig;
+import com.pockyl.handson_delight.HandsOnDelight;
+import com.pockyl.handson_delight.station.PotLogic;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashMap;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+
+/**
+ * The pot's recipes in a book hanging in the air beside it: a green cookbook ({@link RecipeBookModel}), opened out, with the recipes on
+ * its pages, so the player reads and stirs at once. The page on the left lists the dishes, what can be cooked now first; the page on the
+ * right shows the dish under the cursor or the one picked. Pages are measured in units of about a GUI pixel.
+ */
+final class RecipeBook implements NodePainter {
+    /** The page's paper, a unit to a texel, and the ribbon beside it. */
+    private static final Identifier PAPER = HandsOnDelight.id("textures/entity/recipe_book_paper.png");
+    private static final Identifier PAGE_FORWARD = Identifier.parse("textures/gui/sprites/widget/page_forward.png");
+    private static final Identifier PAGE_FORWARD_LIT = Identifier.parse("textures/gui/sprites/widget/page_forward_highlighted.png");
+    private static final Identifier PAGE_BACKWARD = Identifier.parse("textures/gui/sprites/widget/page_backward.png");
+    private static final Identifier PAGE_BACKWARD_LIT = Identifier.parse("textures/gui/sprites/widget/page_backward_highlighted.png");
+    /**
+     * The flat sprite that wells and bars are tinted from: this mod's own, in the off-white of white concrete that their colours were
+     * chosen against, so that a resource pack that retextures concrete does not show through the book.
+     */
+    private static final Identifier WHITE = HandsOnDelight.id("block/white");
+    private static final Quaternionf LYING = new Matrix3f(0.0F, 1.0F, 0.0F, 0.0F, 0.0F, 1.0F, 1.0F, 0.0F, 0.0F).getNormalizedRotation(new Quaternionf());
+    /** How big against the model's own pixels. */
+    private static final float SIZE = 0.72F;
+    /** The paper covers the model's blocks of pages exactly; the covers frame it with a pixel all round. */
+    private static final float PAGE_WIDTH = 6.0F * SIZE;
+    private static final float PAGE_HEIGHT = 8.0F * SIZE;
+    private static final int UNITS_WIDE = 72;
+    private static final int UNITS_HIGH = 96;
+    private static final float UNIT = PAGE_WIDTH / UNITS_WIDE;
+    /** How far the model opens, in its own measure, and the angle that leaves between a page and flat. */
+    private static final float OPEN = 1.17F;
+    /** The paper over the model's own pages, in the model's pixels; a sheet being turned over the pages under it, in pixels. */
+    private static final float PAGE_GAP = 0.09F;
+    private static final float SHEET_LIFT = 0.13F;
+    /** Seconds the covers take to swing open or shut. */
+    private static final float OPEN_TIME = 0.31F;
+    /** How far the camera has come before the book starts to open: it arrives shut and opens before the player's eyes. */
+    private static final float OPEN_FROM = 0.98F;
+    /** How far the camera has come when the book starts to grow, flying in (and is gone, flying back). */
+    private static final float APPEAR_FROM = 0.25F;
+    /** Smaller than this the book is a speck, not a book: it is not drawn. */
+    static final float SPECK = 0.08F;
+    private static final float FLIP_TIME = 0.4F;
+    /** Over the paper, in units: wells, then what lies on them, then what covers that. */
+    private static final float WELL_LIFT = 0.3F;
+    private static final float ITEM_LIFT = 1.2F;
+    /** How thick items are on the page: flat, with their faces well apart, or the two would flicker through each other. */
+    private static final float ITEM_DEPTH = 8.0F;
+    private static final float BLOCK_DEPTH = 0.5F;
+    private static final float COVER_LIFT = 1.9F;
+    private static final int COLUMNS = 3;
+    private static final int ROWS = 4;
+    private static final int PITCH = 18;
+    private static final int WELL_SIZE = 17;
+    private static final int PER_PAGE = COLUMNS * ROWS;
+    /**
+     * Each page is laid out about the middle of its open part, clear of the shade in the fold: the left page's fold is on its right,
+     * the right page's on its left. The list's grid sits in the middle of the left page, the arrows under its outer columns, and
+     * the foot of the right page on the same line as the arrows.
+     */
+    /** The grid, 53 units wide, about the middle of the left page's open part, (72 - 5) / 2. */
+    private static final int GRID_X = 7;
+    private static final int GRID_Y = 5;
+    private static final int ARROW_Y = 81;
+    private static final int ARROW_WIDTH = 23;
+    private static final int ARROW_HEIGHT = 13;
+    private static final int INK = 0xFF4A3418;
+    private static final int WELL = 0x1E5A3C18;
+    private static final int WELL_READY = 0x70E0A83C;
+    private static final int WELL_PICKED = 0xFF8A5A2B;
+    private static final int FADED = 0x55FFFFFF;
+    private static final int RULE = 0x405A3C18;
+    /** Stars on a page: open, the part of the next one already earned, still shut. */
+    private static final int STAR_OPEN = 0xFFD08A1E;
+    private static final int STAR_EARNING = 0x90D08A1E;
+    private static final int STAR_SHUT = 0x305A3C18;
+    /** The paper texture: its size, the page in its corner (the fold on the left), the ribbon and the lit ribbon beside it. */
+    private static final float PAPER_SIZE = 128.0F;
+    private static final float PAPER_U1 = UNITS_WIDE / PAPER_SIZE;
+    private static final float PAPER_V1 = UNITS_HIGH / PAPER_SIZE;
+    private static final float RIBBON_U = 80.0F;
+    private static final float RIBBON_LIT_U = 88.0F;
+    /** Where the tabs take their paper from: clear of the page's darker edge. */
+    private static final float TAB_PAPER_U = 8.0F;
+    private static final float TAB_PAPER_V = 8.0F;
+    private static final float REFRESH_TIME = 1.0F;
+    /** How small it is closed. */
+    private static final float CLOSED_SIZE = 0.62F;
+    /** Closed, it shows its cover: the model turned about the spine, the spine moved to the left of the middle. */
+    private static final float CLOSED_TURN = Mth.HALF_PI;
+    private static final float CLOSED_SHIFT = 3.0F / 16.0F;
+    /** The tabs over the list: where the row starts, each one's width and spacing, height (the others lower), icon, edge. */
+    private static final float TABS_X = GRID_X;
+    private static final float TAB_WIDE = 16.0F;
+    private static final float TAB_PITCH = 18.0F;
+    private static final float TAB_HIGH = 14.0F;
+    private static final float TAB_DROP = 3.0F;
+    private static final float TAB_ICON = 11.0F;
+    private static final int TAB_EDGE = 0x905A3C18;
+    /** The least room kept between the tabs and the page's edges once the row has to move over to fit. */
+    private static final float TAB_MARGIN = 2.0F;
+    /** The ribbon that closes the book, at the top of the right page: a bookmark coming out from under the head of the pages. */
+    private static final int RIBBON_X = 62;
+    private static final int RIBBON_WIDTH = 6;
+    private static final int RIBBON_HEIGHT = 13;
+    /** The shade in the fold of the pages. */
+    private static final int FOLD = 0x285A3C18;
+    private static final int FOLD_WIDTH = 5;
+    /** The right page's middle, clear of the fold's shade on its left. */
+    private static final float RIGHT_MIDDLE = (UNITS_WIDE + FOLD_WIDTH) / 2.0F;
+    /** Small things at the foot of a page: how big, how far apart; the dish at the head of its page. */
+    private static final float FOOT_SIZE = 12.0F;
+    private static final float FOOT_PITCH = 15.0F;
+    private static final float DISH_SIZE = 20.0F;
+    /** The least light the book is drawn in, block and sky: a torch-lit kitchen. */
+    private static final int LIT = 12;
+    /** How long a book handed over waits in the air for the next station to take it, seconds (the server lets the player in). */
+    private static final float HANDOFF_WAIT = 1.0F;
+    /** How small and how big the player can make the book, against its own size. */
+    private static final float SIZE_LEAST = 0.75F;
+    private static final float SIZE_MOST = 1.6F;
+    /** Half the open book over its covers, node units: the pages and a model pixel of cover round them. */
+    private static final float HALF_WIDE = 7.0F * SIZE;
+    private static final float HALF_HIGH = 5.0F * SIZE;
+    /** The corner that sizes the book, the top right one: its sides along the width (the right page at -x) and the height. */
+    private static final int SIZING_CORNER_X = -1;
+    private static final int SIZING_CORNER_Y = 1;
+    /** A corner is taken on the cover's corner and the outer bit of the paper there, clear of the ribbon, node units. */
+    private static final float CORNER_IN = 0.25F;
+    /** How far the book can be moved from its place: a part of its width and of its height. */
+    private static final float MOVE_WIDE = 0.75F;
+    private static final float MOVE_HIGH = 0.5F;
+    /** Kept between the book and the edges of the screen, node units. */
+    private static final float SCREEN_MARGIN = 0.3F;
+    /** How far a corner under the cursor rises towards the player, degrees, and how much a held book comes forward. */
+    private static final float CORNER_RISE = 5.0F;
+    private static final float HELD_GROWTH = 0.03F;
+    /** The bar beside the ingredients when they take more rows than the page has: where it stands, how wide, its shortest grip. */
+    private static final float BAR_X = UNITS_WIDE - 5.5F;
+    private static final float BAR_WIDE = 2.0F;
+    private static final float BAR_LEAST = 6.0F;
+    private static final int BAR_TRACK = 0x285A3C18;
+    private static final int BAR_GRIP = 0xA08A5A2B;
+    /** The lowest an ingredient may reach with nothing under it on the page, units. */
+    private static final float PAGE_FOOT = UNITS_HIGH - 3.0F;
+    /** The keys of the book's size and place in its file: the size, then the place along its width and height, node units. */
+    private static final String[] PLACE_KEYS = {"book.size", "book.x", "book.y"};
+    /** The size and place the player gave the book, the same at every station; read from the file at first use. */
+    private static float[] kept;
+
+    private RecipeBookModel model;
+    /** The size and place drawn now, going after the kept ones (at once while the player holds the book). */
+    private float shownSize;
+    private float shownX;
+    private float shownY;
+    /** Where the cursor is on the book's own plane, node units (x across, z up the page); null: not over it. */
+    private Vector3f pointer;
+    /** The book in the player's hand, by a corner to size it or by the rest to move it; null when nobody holds it. */
+    private Hold hold;
+    /** How much the book is held (comes forward), and the corner raised towards the cursor, each -1 to 1 along width and height. */
+    private float held;
+    private float riseX;
+    private float riseY;
+    /** The first row of ingredients shown when they take more rows than the page has, and the dish it is for. */
+    private int firstRow;
+    private Object rowsFor;
+    /** The first row the picked dish was scrolled to, and that dish: the cursor crossing the list shows others a moment. */
+    private int pickedRow;
+    private Object pickedRowFor;
+    /** The bar beside the ingredients as drawn last (right page units), null when they all fit: its rows and where its grip is. */
+    private Bar bar;
+    /** Where on the grip the player holds it, units from its top; negative while it is not held. */
+    private float gripHeld = -1.0F;
+    /** The move given to the node this frame, scene pixels: its place, the bob, the way over from another station. */
+    private final Vector3f moved = new Vector3f();
+    private List<Entry> entries = List.of();
+    private boolean wanted;
+    private float open;
+    private float flip = 1.0F;
+    private int flipWay = 1;
+    private int page;
+    private Entry picked;
+    /** The key of the dish the player picked by a click since the book opened; a click on it again makes it. */
+    private Object clicked;
+    private Entry hovered;
+    /** The tabs over the list (none for a book of one kind), the kind shown (null: all), the tab under the cursor. */
+    private List<Tab> tabs = List.of();
+    private String tab;
+    private boolean tabRemembered;
+    private Tab hoveredTab;
+    /**
+     * The list keeps its order from the book's opening on: a dish never moves away from where the player found it while they
+     * cook it (a rolled sheet is no longer its ingredients, which would put the dish at the end).
+     */
+    private boolean keepOrder;
+    /** What is drawn on the right page and where, units of that page, for naming it under the cursor. */
+    private final List<Drawn> drawn = new ArrayList<>();
+    private Component tip;
+    /**
+     * The page the player last picked, kept on the client while the game runs: for each station block, and for each kind of
+     * station. Coming back, the book opens at it again while what lies in the station goes on to it.
+     */
+    private static final Map<String, Object> PICKED = new HashMap<>();
+    private float refresh;
+    private float reach;
+    private float time;
+    /** The light the book is drawn in: where it hangs, never darker than a lit kitchen, so it stays readable. */
+    private int shade = LightTexture.FULL_BRIGHT;
+    /** The last time the player's statistics were asked for, milliseconds. */
+    private long statsAsked;
+    /** The dish's name broken into lines, for the entry it was broken for. */
+    private Entry nameFor;
+    private List<FormattedCharSequence> nameLines = List.of();
+    /** Where the cursor is on the left page (units), or on the right one past its width; negative: not on the book. */
+    private float cursorX = -1.0F;
+    private float cursorY = -1.0F;
+    private StationView station;
+    /** The player closed the book by its ribbon: it stays shut at the next station until they open it again. */
+    private static boolean putAway;
+    /** The book in the air between two stations, while the camera flies over, so it does not vanish and open again. */
+    private static Handoff handoff;
+    /** The one this book handed over and still draws at its own place until the next station takes it. */
+    private Handoff leaving;
+    /** Where the book came from, this station's pixels from its own place, while it flies over with the camera; null at home. */
+    private Vector3f arrivingFrom;
+    /** How much of {@code arrivingFrom} is still to go, as drawn last; held: the player went on before it got here, it waits in the air. */
+    private float arrivingLeft = 1.0F;
+    private boolean arrivingHeld;
+    private final Source source;
+
+    /** A book going over to the next station: where it hung in the world and how it was, open or put away. */
+    private static final class Handoff {
+        private final Vec3 where;
+        private final float open;
+        private final boolean wanted;
+        private final float time;
+        private final long since = Util.getMillis();
+        private boolean taken;
+
+        private Handoff(Vec3 where, float open, boolean wanted, float time) {
+            this.where = where;
+            this.open = open;
+            this.wanted = wanted;
+            this.time = time;
+        }
+
+        private boolean isStale() {
+            return Util.getMillis() - since > HANDOFF_WAIT * 1000.0F;
+        }
+    }
+
+    /**
+     * The book taken by the player: by a corner ({@code cornerX}, {@code cornerY} the corner's side, -1 or 1, along the width and the
+     * height) the corner across from it stays and the book grows or shrinks with the hand; by anything else it goes with the hand.
+     * {@code grabX}, {@code grabY}: the point taken, node units; the rest is the book as it was taken.
+     */
+    private record Hold(int cornerX, int cornerY, float grabX, float grabY, float size, float x, float y) {
+        boolean bySize() {
+            return cornerX != 0;
+        }
+    }
+
+    /** The ingredients' bar: {@code rows} in all, {@code shown} at once from {@code first}, its track and grip in right page units. */
+    private record Bar(int rows, int shown, int first, float top, float high, float gripTop, float gripHigh) {
+        boolean onGrip(float x, float y) {
+            return onTrack(x, y) && y >= gripTop - 1.0F && y < gripTop + gripHigh + 1.0F;
+        }
+
+        boolean onTrack(float x, float y) {
+            return x >= BAR_X - 2.0F && x < BAR_X + BAR_WIDE + 2.0F && y >= top && y < top + high;
+        }
+
+        /** The first row for the grip's top at {@code y}. */
+        int rowAt(float y) {
+            float room = high - gripHigh;
+            return room <= 0.0F ? 0 : Math.round((y - top) / room * (rows - shown));
+        }
+    }
+
+    RecipeBook(Source source) {
+        this.source = source;
+        float[] place = kept();
+        shownSize = place[0];
+        shownX = place[1];
+        shownY = place[2];
+    }
+
+    private static float[] kept() {
+        if (kept == null) {
+            kept = new float[] {
+                    Mth.clamp(BookTabs.number(PLACE_KEYS[0], 1.0F), SIZE_LEAST, SIZE_MOST),
+                    BookTabs.number(PLACE_KEYS[1], 0.0F),
+                    BookTabs.number(PLACE_KEYS[2], 0.0F)};
+        }
+        return kept;
+    }
+
+    private static void keep(float size, float x, float y) {
+        float[] place = kept();
+        place[0] = size;
+        place[1] = x;
+        place[2] = y;
+        boolean usual = Math.abs(size - 1.0F) < 0.005F && Math.abs(x) < 0.005F && Math.abs(y) < 0.005F;
+        BookTabs.putNumbers(PLACE_KEYS, usual ? new Float[3] : new Float[] {size, x, y});
+    }
+
+    /** What a station's book lists: its recipes, and what lies in the station already, which counts as the player's. */
+    interface Source {
+        List<Page> pages(StationView view);
+
+        List<ItemStack> inStation(StationView view);
+
+        /** The player picked a page by a click. */
+        default void picked(StationView view, Page page) {
+        }
+
+        /** The key of the page the station is making now (what lies in it), to open the book there; null for none. */
+        default Object current(StationView view) {
+            return null;
+        }
+
+        /**
+         * The kinds of recipe the book can show alone, as tabs over the list, the first one showing them all (kind null). Fewer than
+         * two kinds: no tabs.
+         */
+        default List<Tab> tabs(StationView view) {
+            return List.of();
+        }
+
+        /** Under which name the chosen tab is remembered on the client: one per station type. */
+        default String memory() {
+            return "";
+        }
+
+        /**
+         * Whether what lies in the station now can go on to the page {@code key}, so that a page picked before stays open; by default
+         * when the station makes nothing yet or makes that page.
+         */
+        default boolean fits(StationView view, Object key) {
+            Object current = current(view);
+            return current == null || current.equals(key);
+        }
+    }
+
+    /** Something drawn on the right page, its box in units of that page. */
+    private record Drawn(float x, float y, float size, ItemStack stack) {
+    }
+
+    /** A tab over the list: the kind of recipe it shows ({@code Page.kind}; null: all), drawn as {@code icon}. */
+    record Tab(String kind, ItemStack icon) {
+    }
+
+    /**
+     * One recipe: the dish on the list, what goes in, and small things at the foot of its page, with a note after them. {@code key}
+     * keeps the page picked while the list is read again; {@code stars}: the pot's stars of the dish are shown.
+     */
+    record Page(Object key, ItemStack dish, List<Ingredient> ingredients, List<ItemStack> foot, Component note, boolean stars,
+            String kind) {
+        Page {
+            // ResourceKey.toString() is diagnostic text, not an identifier accepted by station actions.
+            if(key instanceof net.minecraft.resources.ResourceKey<?> recipeKey) key=recipeKey.identifier();
+        }
+        Page(Object key, ItemStack dish, List<Ingredient> ingredients, List<ItemStack> foot, Component note, boolean stars) {
+            this(key, dish, ingredients, foot, note, stars, null);
+        }
+    }
+
+    /** A page, which of its ingredients the player has, and how many of the dish they have made, which opens its stars. */
+    private record Entry(Page page, boolean[] found, int missing, int made) {
+        ItemStack dish() {
+            return page.dish();
+        }
+
+        List<Ingredient> ingredients() {
+            return page.ingredients();
+        }
+
+        boolean isReady() {
+            return missing == 0;
+        }
+    }
+
+    boolean isOpen() {
+        return wanted;
+    }
+
+    /** The player came to the pot: the book is open already, unless they put it away. */
+    void opened(StationView view) {
+        if (!wanted && !putAway && HandsOnConfig.recipeBook()) {
+            toggle(view);
+        }
+    }
+
+    void toggle(StationView view) {
+        station = view;
+        wanted = !wanted;
+        if (wanted) {
+            // How much of each dish the player has made is in their statistics, which the server sends when asked.
+            var connection = Minecraft.getInstance().getConnection();
+            if (connection != null) {
+                connection.send(new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.REQUEST_STATS));
+            }
+            keepOrder = false;
+            read(view);
+            picked = shown(view);
+            clicked = null;
+            page = picked == null ? 0 : entries.indexOf(picked) / PER_PAGE;
+        } else {
+            Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PUT, 1.0F, 0.5F));
+        }
+    }
+
+    /**
+     * The player left the station. Going over to a neighbour, the book goes with them: it stays as it is until the next station's
+     * book takes its place and flies from here to there with the camera. Leaving, it closes and goes away as the camera flies back.
+     */
+    void shut(StationView view) {
+        if (hold != null) {
+            letGo();
+        }
+        Optional<NodeView> node = view.node("book_open");
+        if (DiegesisClient.goingOver() < 1.0F && node.isPresent() && node.get().isVisible()) {
+            passOn(node.get());
+            return;
+        }
+        arrivingFrom = null;
+        arrivingHeld = false;
+        wanted = false;
+    }
+
+    /**
+     * How much of the book is there, 0 to 1: it grows where it hangs as the camera flies in, and goes as the camera flies back, so it
+     * neither pops up before the station is reached nor vanishes in the first frame of leaving. Going over, it is all there.
+     */
+    static float appear(StationView view) {
+        boolean worked = DiegesisClient.focusedStation().map(focused -> focused.pos().equals(view.pos())).orElse(false);
+        if (!worked || DiegesisClient.goingOver() < 1.0F) {
+            return 1.0F;
+        }
+        // Over the last three quarters of the way in, and gone in the first part of the way back: far off it would be a speck.
+        float t = Mth.clamp((DiegesisClient.arrival() - APPEAR_FROM) / (1.0F - APPEAR_FROM), 0.0F, 1.0F);
+        return t * t * (3.0F - 2.0F * t);
+    }
+
+    /** Hands the book over to the next station from where it is now, also half way here (two quick presses of D). */
+    private void passOn(NodeView node) {
+        if (arrivingFrom != null && !arrivingHeld) {
+            arrivingFrom.mul(arrivingLeft);
+            arrivingHeld = true;
+        }
+        leaving = new Handoff(node.worldPosition(), open, wanted, time);
+        handoff = leaving;
+    }
+
+    /** The station the player goes over to is this one: its book takes the one in the air, open as it was, and flies it here. */
+    private void arrive(StationView view, NodeView node, Handoff passing) {
+        handoff = null;
+        passing.taken = true;
+        station = view;
+        arrivingHeld = false;
+        wanted = passing.wanted;
+        open = passing.open;
+        time = passing.time;
+        if (wanted) {
+            var connection = Minecraft.getInstance().getConnection();
+            if (connection != null) {
+                connection.send(new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.REQUEST_STATS));
+            }
+            keepOrder = false;
+            read(view);
+            picked = shown(view);
+            clicked = null;
+            page = picked == null ? 0 : entries.indexOf(picked) / PER_PAGE;
+            turnSound();
+        }
+        // The way back to where it hung, in this station's pixels: the scene may face another way than the one left.
+        Vector3f home = new Vector3f(node.definition().transform().pos());
+        Vec3 origin = view.toWorld(home.x, home.y, home.z);
+        Vec3 alongX = view.toWorld(home.x + 1.0F, home.y, home.z).subtract(origin);
+        Vec3 alongY = view.toWorld(home.x, home.y + 1.0F, home.z).subtract(origin);
+        Vec3 alongZ = view.toWorld(home.x, home.y, home.z + 1.0F).subtract(origin);
+        Vec3 away = passing.where.subtract(origin);
+        arrivingFrom = new Vector3f((float) (away.dot(alongX) / alongX.lengthSqr()), (float) (away.dot(alongY) / alongY.lengthSqr()),
+                (float) (away.dot(alongZ) / alongZ.lengthSqr()));
+    }
+
+    static boolean isWorkedAt(StationView view) {
+        return DiegesisClient.focusedStation().map(focused -> focused.pos().equals(view.pos())).orElse(false);
+    }
+
+    private static void turnSound() {
+        Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PAGE_TURN, 1.0F, 0.6F));
+    }
+
+    /**
+     * The page the player picked last at this station (else at this kind of station) while what lies in it goes on to it; else the
+     * page of what the station makes now; else the first. A page under another tab shows all the tabs' pages.
+     */
+    private Entry shown(StationView view) {
+        List<Object> wanted = new ArrayList<>();
+        for (String memory : List.of(placeMemory(view), kindMemory())) {
+            Object kept = PICKED.get(memory);
+            if (kept != null && source.fits(view, kept)) {
+                wanted.add(kept);
+            }
+        }
+        Object current = source.current(view);
+        if (current != null) {
+            wanted.add(current);
+        }
+        for (Object key : wanted) {
+            Optional<Entry> found = find(key);
+            if (found.isEmpty() && tab != null) {
+                tab = null;
+                keepOrder = false;
+                read(view);
+                found = find(key);
+            }
+            if (found.isPresent()) {
+                return found.get();
+            }
+        }
+        return entries.isEmpty() ? null : entries.get(0);
+    }
+
+    private Optional<Entry> find(Object key) {
+        return entries.stream().filter(entry -> entry.page().key().equals(key)).findFirst();
+    }
+
+    private String kindMemory() {
+        return source.getClass().getName();
+    }
+
+    private String placeMemory(StationView view) {
+        return kindMemory() + "@" + view.pos().asLong();
+    }
+
+    /** The page the player has picked, null for none. */
+    Object pickedKey() {
+        return picked == null ? null : picked.page().key();
+    }
+
+    /** What the player has made changed (a serving, a dish): the stars on the page follow once the server tells the new numbers. */
+    void statsChanged() {
+        long now = Util.getMillis();
+        var connection = Minecraft.getInstance().getConnection();
+        if (wanted && connection != null && now - statsAsked > 1000L) {
+            statsAsked = now;
+            connection.send(new ServerboundClientCommandPacket(ServerboundClientCommandPacket.Action.REQUEST_STATS));
+        }
+    }
+
+    private void read(StationView view) {
+        List<Tab> offered = source.tabs(view);
+        tabs = offered.size() > 2 ? offered : List.of();
+        if (!tabRemembered) {
+            tabRemembered = true;
+            tab = BookTabs.get(source.memory());
+        }
+        if (tabs.stream().noneMatch(it -> Objects.equals(it.kind(), tab))) {
+            tab = null;
+        }
+        List<ItemStack> pool = pool(view);
+        List<Entry> found = new ArrayList<>();
+        for (Page page : source.pages(view)) {
+            // A recipe whose ingredient no item is (an addon's tag nothing fills) cannot be made: it is not offered.
+            if ((tab == null || tab.equals(page.kind())) && Cookable.all(page.ingredients())) {
+                found.add(entry(page, pool));
+            }
+        }
+        if ((keepOrder || cursorX >= 0.0F) && !entries.isEmpty()) {
+            // Under the cursor the list keeps its order: a dish never moves away from where the player points.
+            // Looked up by key: read again every second, a modpack's book of a thousand dishes is no list to search in a sort.
+            Map<Object, Integer> before = new HashMap<>();
+            for (int i = 0; i < entries.size(); i++) {
+                before.putIfAbsent(entries.get(i).page().key(), i);
+            }
+            found.sort(Comparator.comparingInt(entry -> before.getOrDefault(entry.page().key(), Integer.MAX_VALUE)));
+        } else {
+            Map<Entry, String> names = new IdentityHashMap<>();
+            found.forEach(entry -> names.put(entry, entry.dish().getHoverName().getString()));
+            found.sort(Comparator.comparingInt(Entry::missing).thenComparing(names::get));
+        }
+        if (picked != null) {
+            Object kept = picked.page().key();
+            // A reload (a datapack, a script) that took the picked recipe away leaves the first one on the right page, not a blank one.
+            picked = found.stream().filter(entry -> entry.page().key().equals(kept)).findFirst()
+                    .orElse(found.isEmpty() ? null : found.get(0));
+        }
+        entries = found;
+        keepOrder = true;
+        page = Math.min(page, pages() - 1);
+    }
+
+    /** What the player has to cook with: the inventory, the stack in the hand (a knife taken to cut), and what lies in the station. */
+    private List<ItemStack> pool(StationView view) {
+        List<ItemStack> pool = new ArrayList<>();
+        var player = Minecraft.getInstance().player;
+        if (player != null) {
+            for (int i = 0; i < Inventory.INVENTORY_SIZE; i++) {
+                pool.add(player.getInventory().getItem(i));
+            }
+            pool.add(player.inventoryMenu.getCarried());
+        }
+        pool.addAll(source.inStation(view));
+        pool.removeIf(ItemStack::isEmpty);
+        return pool;
+    }
+
+    private static Entry entry(Page page, List<ItemStack> pool) {
+        int[] left = pool.stream().mapToInt(ItemStack::getCount).toArray();
+        List<Ingredient> ingredients = page.ingredients();
+        boolean[] found = new boolean[ingredients.size()];
+        int missing = 0;
+        for (int i = 0; i < found.length; i++) {
+            for (int stack = 0; stack < left.length && !found[i]; stack++) {
+                if (left[stack] > 0 && ingredients.get(i).test(pool.get(stack))) {
+                    left[stack]--;
+                    found[i] = true;
+                }
+            }
+            missing += found[i] ? 0 : 1;
+        }
+        var player = Minecraft.getInstance().player;
+        int made = player == null ? 0 : player.getStats().getValue(Stats.ITEM_CRAFTED.get(page.dish().getItem()));
+        return new Entry(page, found, missing, made);
+    }
+
+    private int pages() {
+        return Math.max(1, (entries.size() + PER_PAGE - 1) / PER_PAGE);
+    }
+
+    /** Every frame: opens or closes, hangs in the air, follows the cursor. */
+    void frame(StationView view, float dt) {
+        station = view;
+        NodeView node = view.node("book_open").orElse(null);
+        if (node == null) {
+            return;
+        }
+        if (!HandsOnConfig.recipeBook()) {
+            node.setVisible(false);
+            return;
+        }
+        Handoff passing = handoff;
+        if (leaving != null) {
+            if (leaving.taken || leaving.isStale()) {
+                if (handoff == leaving) {
+                    handoff = null;
+                }
+                leaving = null;
+                arrivingFrom = null;
+                arrivingHeld = false;
+                wanted = false;
+                open = 0.0F;
+            }
+        } else if (passing != null && !passing.taken && !passing.isStale() && isWorkedAt(view)) {
+            arrive(view, node, passing);
+        }
+        float flight = DiegesisClient.goingOver();
+        if (arrivingFrom != null && !arrivingHeld && leaving == null && flight < 1.0F && !isWorkedAt(view)) {
+            // The player went on before the book got here (the station was not theirs yet, so it was not shut).
+            passOn(node);
+        }
+        if (arrivingFrom != null && !arrivingHeld && (flight >= 1.0F || !isWorkedAt(view))) {
+            arrivingFrom = null;
+        }
+        float appear = appear(view);
+        node.setVisible((view.isFocused() || leaving != null || arrivingFrom != null || isWorkedAt(view)) && appear > SPECK);
+        if (!node.isVisible() && leaving == null) {
+            open = 0.0F;
+        }
+        time += dt;
+        // It comes in shut, growing with the camera, and opens once the camera is there: the covers swing out before the eyes.
+        boolean opening = wanted && appear >= OPEN_FROM;
+        if (opening && open <= 0.0F) {
+            turnSound();
+        }
+        open = Mth.clamp(open + (opening ? dt : -dt) / OPEN_TIME, 0.0F, 1.0F);
+        flip = Math.min(1.0F, flip + dt / FLIP_TIME);
+        // Grows and opens where it hangs, breathing a little.
+        float eased = eased();
+        reach = Mth.lerp(Math.min(1.0F, dt * 12.0F), reach, node.isHovered() && !wanted ? 1.0F : 0.0F);
+        place(view, node, dt, appear >= 1.0F && arrivingFrom == null);
+        node.scaleTo(Mth.lerp(eased, CLOSED_SIZE * (1.0F + 0.08F * reach), 1.0F) * appear * drawnSize(), 0.0F);
+        float bob = Mth.sin(time * 1.3F) * 0.14F;
+        Vector3f shift = onScene(node, shownX, shownY);
+        Quaternionf turn = facing(view, node, shift);
+        if (arrivingFrom != null) {
+            // With the camera, on the same easing: the book keeps its place on the screen while the kitchen moves under it.
+            float left = arrivingHeld ? 1.0F : 1.0F - flight;
+            arrivingLeft = left;
+            moved.set(arrivingFrom).mul(left).add(shift.x * (1.0F - left), shift.y * (1.0F - left) + bob, shift.z * (1.0F - left));
+        } else {
+            moved.set(shift.x, shift.y + bob, shift.z);
+        }
+        node.moveTo(moved.x, moved.y, moved.z, 0.0F);
+        // It faces the player wherever it was moved, sways a little, and a corner under the cursor rises towards the player, as a
+        // page corner is lifted to be taken.
+        turn.mul(Transform.toQuaternion(new Vector3f(Mth.sin(time * 0.9F) * 1.2F - riseY * CORNER_RISE, Mth.cos(time * 0.7F) * 1.5F,
+                riseX * CORNER_RISE), new Quaternionf()));
+        Vector3f angles = turn.getEulerAnglesYXZ(new Vector3f());
+        node.rotateTo(angles.x * Mth.RAD_TO_DEG, angles.y * Mth.RAD_TO_DEG, angles.z * Mth.RAD_TO_DEG, 0.0F);
+        refresh -= dt;
+        if (refresh <= 0.0F && wanted) {
+            refresh = REFRESH_TIME;
+            read(view);
+        }
+        follow(view, node);
+        name(node);
+    }
+
+    /**
+     * The book's size and place: going after the hand while the player holds it, else easing to what was kept. Once the camera is
+     * in, the book is kept on the screen whatever the window: a smaller window moves it in (or makes it smaller) only while it is
+     * that small, the kept place stays.
+     */
+    private void place(StationView view, NodeView node, float dt, boolean settled) {
+        pointer = view.pointerOn("book_open", 0.0F).orElse(null);
+        Bar ingredients = bar;
+        if (gripHeld >= 0.0F) {
+            if (!leftHeld() || ingredients == null || open < 1.0F) {
+                gripHeld = -1.0F;
+            } else if (pointer != null) {
+                // The grip goes with the hand, also off the page, a whole row at a time.
+                float y = (PAGE_HEIGHT / 2.0F - pointer.z) / UNIT;
+                int row = Mth.clamp(ingredients.rowAt(y - gripHeld), 0, ingredients.rows() - ingredients.shown());
+                if (row != firstRow) {
+                    firstRow = row;
+                    rowSound();
+                }
+            }
+        }
+        boolean taking = hold != null;
+        if (taking && (!leftHeld() || !node.isVisible() || open < 1.0F)) {
+            letGo();
+        } else if (taking && pointer != null) {
+            follow(hold, settled ? onScreen(view, node, home(node)) : null);
+        }
+        float[] place = kept();
+        float size = place[0];
+        float x = place[1];
+        float y = place[2];
+        float[] screen = settled && hold == null ? onScreen(view, node, home(node)) : null;
+        if (screen != null) {
+            float[] fitted = fit(screen, size, x, y, 0, 0);
+            size = fitted[0];
+            x = fitted[1];
+            y = fitted[2];
+        }
+        float ease = hold != null ? 1.0F : Math.min(1.0F, dt * 12.0F);
+        shownSize = Mth.lerp(ease, shownSize, size);
+        shownX = Mth.lerp(ease, shownX, x);
+        shownY = Mth.lerp(ease, shownY, y);
+        float step = Math.min(1.0F, dt * 14.0F);
+        held = Mth.lerp(step, held, hold != null ? 1.0F : 0.0F);
+        int[] corner = hold != null ? (hold.bySize() ? new int[] {hold.cornerX(), hold.cornerY()} : null)
+                : wanted && open >= 1.0F && node.isHovered() && hovered == null && hoveredTab == null && !onRibbon()
+                        ? corner(riseX != 0.0F || riseY != 0.0F ? CORNER_IN * 0.6F : 0.0F) : null;
+        riseX = Mth.lerp(step, riseX, corner == null ? 0.0F : corner[0]);
+        riseY = Mth.lerp(step, riseY, corner == null ? 0.0F : corner[1]);
+        if (Math.abs(riseX) < 0.002F && Math.abs(riseY) < 0.002F) {
+            riseX = 0.0F;
+            riseY = 0.0F;
+        }
+    }
+
+    /** The book in the hand goes after it: sized from the corner across, or moved, then kept as far as the limits and the screen allow. */
+    private void follow(Hold taken, float[] screen) {
+        float size;
+        float x;
+        float y;
+        if (taken.bySize()) {
+            // The corner across stays; the size follows the hand along the line from that corner to where the book was taken. The
+            // hand is on the plane the book hangs in at its own place and size: the node's units grow with the book.
+            float handX = shownX + pointer.x * drawnSize();
+            float handY = shownY + pointer.z * drawnSize();
+            float stayX = taken.x() - taken.cornerX() * HALF_WIDE * taken.size();
+            float stayY = taken.y() - taken.cornerY() * HALF_HIGH * taken.size();
+            float fromX = taken.x() + taken.grabX() * taken.size() - stayX;
+            float fromY = taken.y() + taken.grabY() * taken.size() - stayY;
+            float along = ((handX - stayX) * fromX + (handY - stayY) * fromY) / Math.max(1.0E-4F, fromX * fromX + fromY * fromY);
+            size = Mth.clamp(taken.size() * along, SIZE_LEAST, SIZE_MOST);
+            x = stayX + taken.cornerX() * HALF_WIDE * size;
+            y = stayY + taken.cornerY() * HALF_HIGH * size;
+        } else {
+            size = taken.size();
+            // The point taken stays under the hand.
+            x = shownX + (pointer.x - taken.grabX()) * drawnSize();
+            y = shownY + (pointer.z - taken.grabY()) * drawnSize();
+        }
+        float[] fitted = screen == null ? limited(size, x, y) : fit(screen, size, x, y, taken.bySize() ? taken.cornerX() : 0,
+                taken.bySize() ? taken.cornerY() : 0);
+        kept()[0] = fitted[0];
+        kept()[1] = fitted[1];
+        kept()[2] = fitted[2];
+    }
+
+    /**
+     * Whether the left button is down now. The game's own {@code MouseHandler.isLeftPressed} is only kept while no screen is open,
+     * and the station is one: it always says up there.
+     */
+    private static boolean leftHeld() {
+        return GLFW.glfwGetMouseButton(Minecraft.getInstance().getWindow().handle(), GLFW.GLFW_MOUSE_BUTTON_LEFT) == GLFW.GLFW_PRESS;
+    }
+
+    /** The size the book is drawn at, against its own: as given, and a little bigger while it is held. */
+    private float drawnSize() {
+        return shownSize * (1.0F + HELD_GROWTH * held);
+    }
+
+    /** The place kept within the reach of its own: a part of the book's width and height from where it hangs. */
+    private static float[] limited(float size, float x, float y) {
+        return new float[] {size, Mth.clamp(x, -MOVE_WIDE * 2.0F * HALF_WIDE, MOVE_WIDE * 2.0F * HALF_WIDE),
+                Mth.clamp(y, -MOVE_HIGH * 2.0F * HALF_HIGH, MOVE_HIGH * 2.0F * HALF_HIGH)};
+    }
+
+    /**
+     * The book at {@code size} and {@code x, y} put where all of it is on the screen ({@code screen}: the screen's corners on the book's
+     * plane), within its reach. A book too big for the screen is made smaller: from the corner across from {@code cornerX, cornerY}
+     * when one is held, else about its middle.
+     */
+    private static float[] fit(float[] screen, float size, float x, float y, int cornerX, int cornerY) {
+        float stayX = x - cornerX * HALF_WIDE * size;
+        float stayY = y - cornerY * HALF_HIGH * size;
+        float[] place = limited(size, x, y);
+        for (int tries = 0; tries < 40; tries++) {
+            place = limited(size, x, y);
+            if (pushIn(screen, place) || size <= SIZE_LEAST) {
+                return place;
+            }
+            size = Math.max(SIZE_LEAST, size - 0.02F);
+            x = cornerX != 0 ? stayX + cornerX * HALF_WIDE * size : x;
+            y = cornerY != 0 ? stayY + cornerY * HALF_HIGH * size : y;
+        }
+        return place;
+    }
+
+    /** Moves {@code place} (size, x, y) in from every edge of the screen it reaches over; true when all of it is on the screen then. */
+    private static boolean pushIn(float[] screen, float[] place) {
+        for (int pass = 0; pass < 3; pass++) {
+            for (int edge = 0; edge < 4; edge++) {
+                float[] in = inward(screen, edge);
+                float clear = in == null ? SCREEN_MARGIN : clearance(in, place);
+                if (clear < SCREEN_MARGIN) {
+                    place[1] += in[0] * (SCREEN_MARGIN - clear);
+                    place[2] += in[1] * (SCREEN_MARGIN - clear);
+                }
+            }
+        }
+        // Pushed in from one side and out again over the other: it does not fit.
+        for (int edge = 0; edge < 4; edge++) {
+            float[] in = inward(screen, edge);
+            if (in != null && clearance(in, place) < SCREEN_MARGIN * 0.5F) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /** An edge of the screen on the book's plane: its normal turned to the inside, and a point of it; null when it has no length. */
+    private static float[] inward(float[] screen, int edge) {
+        float fromX = screen[edge * 2];
+        float fromY = screen[edge * 2 + 1];
+        float alongX = screen[(edge + 1) % 4 * 2] - fromX;
+        float alongY = screen[(edge + 1) % 4 * 2 + 1] - fromY;
+        float length = Mth.sqrt(alongX * alongX + alongY * alongY);
+        if (length < 1.0E-4F) {
+            return null;
+        }
+        float inX = -alongY / length;
+        float inY = alongX / length;
+        float middleX = (screen[0] + screen[2] + screen[4] + screen[6]) / 4.0F;
+        float middleY = (screen[1] + screen[3] + screen[5] + screen[7]) / 4.0F;
+        float sign = inX * (middleX - fromX) + inY * (middleY - fromY) < 0.0F ? -1.0F : 1.0F;
+        return new float[] {inX * sign, inY * sign, fromX, fromY};
+    }
+
+    /** How far all of the book at {@code place} is inside the edge {@code in}; negative: it reaches over. */
+    private static float clearance(float[] in, float[] place) {
+        return in[0] * (place[1] - in[2]) + in[1] * (place[2] - in[3]) - Math.abs(in[0]) * HALF_WIDE * place[0]
+                - Math.abs(in[1]) * HALF_HIGH * place[0];
+    }
+
+    /**
+     * The corners of the screen on the plane the book hangs in at its own place (node units at its own size: x across, y up the page),
+     * in the order top left, top right, bottom right, bottom left; null while the camera cannot tell.
+     */
+    private static float[] onScreen(StationView view, NodeView node, Vector3f origin) {
+        Transform own = node.definition().transform();
+        Quaternionf turn = Transform.toQuaternion(own.rotation(), new Quaternionf());
+        float base = own.scale().x();
+        Vector3f across = turn.transform(new Vector3f(base, 0.0F, 0.0F));
+        Vector3f up = turn.transform(new Vector3f(0.0F, 0.0F, base));
+        Vector3f normal = turn.transform(new Vector3f(0.0F, 1.0F, 0.0F));
+        float[] corners = new float[8];
+        for (int i = 0; i < 4; i++) {
+            float screenX = i == 1 || i == 2 ? 1.0F : 0.0F;
+            float screenY = i >= 2 ? 1.0F : 0.0F;
+            // The line from the eye through that corner of the screen, where it goes through the book's plane.
+            Vector3f[] line = line(view, screenX, screenY, origin.y);
+            if (line == null) {
+                return null;
+            }
+            float towards = line[1].dot(normal);
+            if (Math.abs(towards) < 1.0E-4F) {
+                return null;
+            }
+            Vector3f hit = new Vector3f(line[1]).mul(new Vector3f(origin).sub(line[0]).dot(normal) / towards).add(line[0]).sub(origin);
+            corners[i * 2] = hit.dot(across) / across.lengthSquared();
+            corners[i * 2 + 1] = hit.dot(up) / up.lengthSquared();
+        }
+        return corners;
+    }
+
+    /** Where the book hangs in the scene at its own place, pixels: where it is drawn less the move given to it. */
+    private Vector3f home(NodeView node) {
+        return node.scenePosition().sub(moved);
+    }
+
+    /**
+     * The turn that keeps the book facing the player wherever it is moved: from the way it looks at the eye from its own place to the
+     * way it would from where it is, in the node's own axes (its scene turn comes first); none while the camera cannot tell.
+     */
+    private Quaternionf facing(StationView view, NodeView node, Vector3f move) {
+        Vector3f origin = home(node);
+        Vector3f eye = eye(view, origin.y);
+        if (eye == null) {
+            return new Quaternionf();
+        }
+        Vector3f fromHome = new Vector3f(eye).sub(origin).normalize();
+        Vector3f fromHere = new Vector3f(eye).sub(origin).sub(move).normalize();
+        Quaternionf own = Transform.toQuaternion(node.definition().transform().rotation(), new Quaternionf());
+        Quaternionf turn = new Quaternionf().rotationTo(fromHome, fromHere);
+        return new Quaternionf(own).conjugate().mul(turn).mul(own);
+    }
+
+    /** Where the player's eye is in the scene, pixels: where the lines through two points of the screen meet; null when not known. */
+    private static Vector3f eye(StationView view, float height) {
+        Vector3f[] middle = line(view, 0.5F, 0.5F, height);
+        Vector3f[] corner = line(view, 0.1F, 0.1F, height);
+        if (middle == null || corner == null) {
+            return null;
+        }
+        // The closest points of the two lines; through one eye they meet.
+        Vector3f across = new Vector3f(middle[0]).sub(corner[0]);
+        float aa = middle[1].dot(middle[1]);
+        float ab = middle[1].dot(corner[1]);
+        float bb = corner[1].dot(corner[1]);
+        float ad = middle[1].dot(across);
+        float bd = corner[1].dot(across);
+        float under = aa * bb - ab * ab;
+        if (Math.abs(under) < 1.0E-6F) {
+            return null;
+        }
+        float along = (ab * bd - bb * ad) / under;
+        return new Vector3f(middle[1]).mul(along).add(middle[0]);
+    }
+
+    /** The line from the eye through a point of the screen: a point of it and its way, scene pixels; null when not known. */
+    private static Vector3f[] line(StationView view, float x, float y, float height) {
+        Optional<Vector3f> near = view.screenOn(x, y, height);
+        Optional<Vector3f> far = view.screenOn(x, y, height - 8.0F);
+        if (near.isEmpty() || far.isEmpty()) {
+            return null;
+        }
+        return new Vector3f[] {far.get(), new Vector3f(near.get()).sub(far.get())};
+    }
+
+    /** {@code x, y} on the book's plane (node units at its own size) as a move of the node in the scene, pixels. */
+    private static Vector3f onScene(NodeView node, float x, float y) {
+        Transform home = node.definition().transform();
+        float base = home.scale().x();
+        return Transform.toQuaternion(home.rotation(), new Quaternionf()).transform(new Vector3f(x * base, 0.0F, y * base));
+    }
+
+    /**
+     * The corner of the open book under the cursor that sizes it, its sides along the width and the height (-1 or 1); null off it.
+     * Only the top right one does, one place to find: the left page lies at +x, the top of the pages at +z. A corner already raised
+     * is kept a little further out ({@code more}), so that rising does not take it from under the cursor.
+     */
+    private int[] corner(float more) {
+        if (pointer == null) {
+            return null;
+        }
+        float x = Math.abs(pointer.x);
+        float y = Math.abs(pointer.z);
+        float in = CORNER_IN + more;
+        boolean onCorner = x > PAGE_WIDTH - in && y > PAGE_HEIGHT / 2.0F - in && x < HALF_WIDE + in && y < HALF_HIGH + in;
+        return onCorner && pointer.x < 0.0F && pointer.z > 0.0F ? new int[] {SIZING_CORNER_X, SIZING_CORNER_Y} : null;
+    }
+
+    /**
+     * The mouse wheel over the book: over the ingredients that take more rows than the page has it goes down and up them, over the
+     * list it turns its pages. True when the wheel was over the book, so that nothing behind it turns.
+     */
+    boolean scroll(double amount) {
+        if (!wanted || open < 1.0F || amount == 0.0) {
+            return wanted;
+        }
+        int way = amount > 0.0 ? -1 : 1;
+        if (cursorX >= UNITS_WIDE && bar != null) {
+            scrollRows(way);
+        } else if (cursorX >= 0.0F && cursorX < UNITS_WIDE) {
+            turn(way);
+        }
+        return true;
+    }
+
+    private void scrollRows(int by) {
+        Bar ingredients = bar;
+        if (ingredients == null) {
+            return;
+        }
+        int row = Mth.clamp(firstRow + by, 0, ingredients.rows() - ingredients.shown());
+        if (row != firstRow) {
+            firstRow = row;
+            rowSound();
+        }
+    }
+
+    private static void rowSound() {
+        Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PAGE_TURN, 1.6F, 0.15F));
+    }
+
+    /**
+     * A press on the open book where nothing of the recipes is: the left button takes it (a corner to size it, the rest to move it), the
+     * right one puts it back to its own size and place.
+     */
+    private void take(int button) {
+        if (open < 1.0F || flip < 1.0F || pointer == null) {
+            return;
+        }
+        float[] place = kept();
+        if (button == 1) {
+            if (place[0] != 1.0F || place[1] != 0.0F || place[2] != 0.0F) {
+                keep(1.0F, 0.0F, 0.0F);
+                Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PUT, 1.1F, 0.4F));
+            }
+            return;
+        }
+        if (button != 0) {
+            return;
+        }
+        // Taken as it is drawn, which a small window may have moved in from the kept place.
+        int[] corner = corner(CORNER_IN * 0.6F);
+        hold = new Hold(corner == null ? 0 : corner[0], corner == null ? 0 : corner[1], pointer.x, pointer.z, shownSize, shownX, shownY);
+        place[0] = shownSize;
+        place[1] = shownX;
+        place[2] = shownY;
+        Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PAGE_TURN, 1.3F, 0.35F));
+    }
+
+    /** The player let the book go: it settles where it is, and the place is kept for the next time. */
+    private void letGo() {
+        hold = null;
+        float[] place = kept();
+        keep(place[0], place[1], place[2]);
+        Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PUT, 1.25F, 0.3F));
+    }
+
+    /** Under the cursor a dish or what goes in is named, as an item in a slot is. */
+    private void name(NodeView node) {
+        ItemStack under = hovered != null ? hovered.dish() : ItemStack.EMPTY;
+        if (hovered == null && hoveredTab == null && cursorX >= UNITS_WIDE && !onRibbon()) {
+            float x = cursorX - UNITS_WIDE;
+            for (Drawn thing : drawn) {
+                if (x >= thing.x() && x < thing.x() + thing.size() && cursorY >= thing.y() && cursorY < thing.y() + thing.size()) {
+                    under = thing.stack();
+                }
+            }
+        }
+        Component text = under.isEmpty() ? Component.empty() : under.getHoverName();
+        if (!Objects.equals(text, tip)) {
+            tip = text;
+            node.setTooltip(text);
+        }
+    }
+
+    /** How far open the book is drawn: the covers lift slowly, swing over and settle flat, and close the same way back. */
+    private float eased() {
+        return open * open * (3.0F - 2.0F * open);
+    }
+
+    /** The angle between a lying page and flat at this opening: the pages rise a little towards their outer edges. */
+    private float pageTilt() {
+        return Mth.HALF_PI - 1.25F * OPEN * eased();
+    }
+
+    /** How high the fold of the pages stands over the node's plane, pixels. */
+    private float foldHeight() {
+        return (Mth.sin(1.25F * OPEN * eased()) + PAGE_GAP) * SIZE;
+    }
+
+    private void follow(StationView view, NodeView node) {
+        cursorX = -1.0F;
+        cursorY = -1.0F;
+        hovered = null;
+        hoveredTab = null;
+        if (flip < 1.0F || open < 1.0F) {
+            return;
+        }
+        // The pages rise from the fold towards their outer edges: the cursor's ray meets a page above the fold's plane, the higher
+        // the further out. A few steps find the height of the page where the ray comes down on it.
+        float tilt = pageTilt();
+        float fold = foldHeight();
+        float height = fold;
+        Vector3f point = null;
+        for (int step = 0; step < 4; step++) {
+            Optional<Vector3f> cursor = view.pointerOn("book_open", height);
+            if (cursor.isEmpty()) {
+                return;
+            }
+            point = cursor.get();
+            height = fold + Math.abs(point.x) * Mth.sin(tilt) / Mth.cos(tilt);
+        }
+        float y = (PAGE_HEIGHT / 2.0F - point.z) / UNIT;
+        // Along the page from the fold; the left page runs from its edge at +x to the fold at 0, the right one on from there.
+        float along = Math.abs(point.x) / Mth.cos(tilt);
+        float x = point.x > 0.0F ? (PAGE_WIDTH - along) / UNIT : UNITS_WIDE + along / UNIT;
+        boolean overTabs = !tabs.isEmpty() && x >= 0.0F && x < UNITS_WIDE && y >= -TAB_HIGH && y < 0.0F;
+        if (x >= 0.0F && x < UNITS_WIDE * 2 && (y >= 0.0F || overTabs) && y < UNITS_HIGH) {
+            cursorX = x;
+            cursorY = y;
+            hovered = entryAt(x, y);
+            hoveredTab = overTabs ? tabAt(x) : null;
+        }
+    }
+
+    private Entry entryAt(float x, float y) {
+        int column = Mth.floor((x - GRID_X) / PITCH);
+        int row = Mth.floor((y - GRID_Y) / PITCH);
+        int index = page * PER_PAGE + row * COLUMNS + column;
+        return column >= 0 && column < COLUMNS && row >= 0 && row < ROWS && index < entries.size() ? entries.get(index) : null;
+    }
+
+    private Tab tabAt(float x) {
+        float start = tabsX();
+        float pitch = tabPitch();
+        // A tab drawn later lies over the one before it: each shows from its own left edge to the next one's.
+        int index = Math.min(Mth.floor((x - start) / pitch), tabs.size() - 1);
+        float into = x - start - index * pitch;
+        return index >= 0 && into < TAB_WIDE ? tabs.get(index) : null;
+    }
+
+    /** Where the row of tabs starts: its usual place while they fit over the left page, else nearer its edge. */
+    private float tabsX() {
+        return TABS_X + (tabs.size() - 1) * TAB_PITCH + TAB_WIDE <= UNITS_WIDE - TAB_MARGIN ? TABS_X : TAB_MARGIN;
+    }
+
+    /** How far apart the tabs stand: as usual, or closer, overlapping, so that however many there are all stay over the left page. */
+    private float tabPitch() {
+        if (tabs.size() < 2) {
+            return TAB_PITCH;
+        }
+        return Math.min(TAB_PITCH, (UNITS_WIDE - TAB_MARGIN - tabsX() - TAB_WIDE) / (tabs.size() - 1));
+    }
+
+    private boolean onRibbon() {
+        return cursorX >= UNITS_WIDE + RIBBON_X && cursorX < UNITS_WIDE + RIBBON_X + RIBBON_WIDTH && cursorY >= 0.0F && cursorY < RIBBON_HEIGHT;
+    }
+
+    /**
+     * A click on the book: opens it; open it picks a dish, turns the page, or closes by its ribbon; anywhere else the book is taken in
+     * the hand (by a corner to size it), and the right button puts it back to its own size and place.
+     */
+    void click(StationView view, int button) {
+        boolean onArrow = cursorY >= ARROW_Y && cursorY < ARROW_Y + ARROW_HEIGHT && cursorX >= 0.0F && cursorX < UNITS_WIDE;
+        Bar ingredients = bar;
+        if (wanted && ingredients != null && cursorX >= UNITS_WIDE && ingredients.onTrack(cursorX - UNITS_WIDE, cursorY)) {
+            if (button == 0 && ingredients.onGrip(cursorX - UNITS_WIDE, cursorY)) {
+                gripHeld = Mth.clamp(cursorY - ingredients.gripTop(), 0.0F, ingredients.gripHigh());
+            } else if (button == 0) {
+                // Beside the grip: on by as many rows as are shown, towards the click.
+                scrollRows(cursorY < ingredients.gripTop() ? -ingredients.shown() : ingredients.shown());
+            }
+        } else if (wanted && !onRibbon() && hoveredTab == null && hovered == null && !onArrow) {
+            take(button);
+        } else if (!wanted || onRibbon()) {
+            toggle(view);
+            putAway = !wanted;
+        } else if (hoveredTab != null) {
+            if (!Objects.equals(tab, hoveredTab.kind())) {
+                tab = hoveredTab.kind();
+                BookTabs.put(source.memory(), tab);
+                page = 0;
+                flip = 1.0F;
+                keepOrder = false;
+                read(view);
+                // The right page shows the first of the kind until another is picked.
+                if (picked == null && !entries.isEmpty()) {
+                    picked = entries.get(0);
+                }
+                turnSound();
+            }
+        } else if (hovered != null) {
+            // The first click picks the dish, to read it; a click on the dish picked so goes on to make it from the inventory.
+            boolean again = hovered.page().key().equals(clicked);
+            picked = hovered;
+            clicked = picked.page().key();
+            PICKED.put(placeMemory(view), picked.page().key());
+            PICKED.put(kindMemory(), picked.page().key());
+            if (again) {
+                source.picked(view, picked.page());
+            } else {
+                Minecraft.getInstance().getSoundManager().play(SimpleSoundInstance.forUI(SoundEvents.BOOK_PAGE_TURN, 1.4F, 0.3F));
+            }
+        } else if (cursorY >= ARROW_Y && cursorY < ARROW_Y + ARROW_HEIGHT) {
+            if (cursorX >= GRID_X && cursorX < GRID_X + ARROW_WIDTH) {
+                turn(-1);
+            } else if (cursorX >= GRID_X + COLUMNS * PITCH - (PITCH - WELL_SIZE) - ARROW_WIDTH
+                    && cursorX < GRID_X + COLUMNS * PITCH - (PITCH - WELL_SIZE)) {
+                turn(1);
+            }
+        }
+    }
+
+    private void turn(int by) {
+        int next = Mth.clamp(page + by, 0, pages() - 1);
+        if (next != page && flip >= 1.0F) {
+            page = next;
+            flip = 0.0F;
+            flipWay = by;
+            turnSound();
+        }
+    }
+
+    /** It hangs before the camera and sways: drawn by the scene, its edges showed steps. */
+    @Override
+    public boolean smooth() {
+        return true;
+    }
+
+    @Override
+    public void paint(PoseStack poseStack, MultiBufferSource buffers, int light) {
+        shade = LightTexture.pack(Math.max(LightTexture.block(light), LIT), Math.max(LightTexture.sky(light), LIT));
+        if (model == null) {
+            model = RecipeBookModel.bake();
+        }
+        float eased = eased();
+        float closed = 1.0F - eased;
+        // How far each cover has turned from shut, as the enchanting table's book turns them.
+        float angle = 1.25F * OPEN * eased;
+        poseStack.pushPose();
+        poseStack.mulPose(LYING);
+        poseStack.scale(16.0F * SIZE, 16.0F * SIZE, 16.0F * SIZE);
+        poseStack.mulPose(new Quaternionf().rotationY(CLOSED_TURN * closed));
+        poseStack.translate(-CLOSED_SHIFT * closed, 0.0F, 0.0F);
+        model.setupAnim(angle);
+        // Cut out: the brass corners are triangles on square caps.
+        model.render(poseStack, buffers.getBuffer(net.minecraft.client.renderer.rendertype.RenderTypes.entityCutout(RecipeBookModel.TEXTURE)), shade, OverlayTexture.NO_OVERLAY);
+        poseStack.popPose();
+        if (open > 0.0F) {
+            // The sheets go with the model: the same turn from closed, the same angle of the pages all the way open.
+            poseStack.pushPose();
+            poseStack.mulPose(new Quaternionf().rotationZ(CLOSED_TURN * closed));
+            poseStack.translate(0.0F, -CLOSED_SHIFT * 16.0F * SIZE * closed, 0.0F);
+            spread(poseStack, buffers, Mth.HALF_PI - angle, (Mth.sin(angle) + PAGE_GAP) * SIZE);
+            poseStack.popPose();
+        }
+    }
+
+    /**
+     * The open pages. Turning, three are on show: a sheet goes over from one side to the other with one page on its face and the next on
+     * its back, and the page it uncovers lies ready under it, so nothing appears or goes away.
+     */
+    private void spread(PoseStack poseStack, MultiBufferSource buffers, float tilt, float height) {
+        if (flip >= 1.0F) {
+            side(poseStack, buffers, true, tilt, height, page, true);
+            side(poseStack, buffers, false, -tilt, height, page, false);
+            return;
+        }
+        float over = flip * flip * (3.0F - 2.0F * flip);
+        // Forward the old list stays on the left until the sheet covers it with the new one; back the old list itself lifts off.
+        boolean forward = flipWay > 0;
+        side(poseStack, buffers, true, tilt, height, forward ? page - 1 : page, true);
+        side(poseStack, buffers, false, -tilt, height, page, false);
+        float right = -tilt;
+        float left = tilt - Mth.PI;
+        float turn = forward ? Mth.lerp(over, right, left) : Mth.lerp(over, left, right);
+        float lifted = height + SHEET_LIFT;
+        if (turn > -Mth.HALF_PI) {
+            side(poseStack, buffers, false, turn, lifted, page, false);
+        } else {
+            side(poseStack, buffers, true, turn + Mth.PI, lifted, forward ? page : page + 1, false);
+        }
+    }
+
+    /** One side of a sheet, turned about the fold: units run right and down as on a screen. {@code resting}: the tabs stand on it. */
+    private void side(PoseStack poseStack, MultiBufferSource buffers, boolean left, float turn, float height, int listPage,
+            boolean resting) {
+        poseStack.pushPose();
+        poseStack.translate(0.0F, height, 0.0F);
+        poseStack.mulPose(new Quaternionf().rotationZ(turn));
+        Matrix4f sheet = new Matrix4f(-UNIT, 0.0F, 0.0F, 0.0F, 0.0F, 0.0F, -UNIT, 0.0F, 0.0F, UNIT, 0.0F, 0.0F, left ? PAGE_WIDTH : 0.0F, 0.0F, PAGE_HEIGHT / 2.0F, 1.0F);
+        poseStack.last().pose().mul(sheet);
+        Sheet canvas = new Sheet(poseStack, buffers);
+        canvas.paper(left);
+        canvas.rect(left ? UNITS_WIDE - FOLD_WIDTH : 0.0F, 0.0F, FOLD_WIDTH, UNITS_HIGH, 0.1F, FOLD);
+        canvas.rect(left ? UNITS_WIDE - 2.0F : 0.0F, 0.0F, 2.0F, UNITS_HIGH, 0.15F, FOLD);
+        if (left) {
+            if (resting) {
+                drawTabs(canvas);
+            }
+            drawList(canvas, listPage);
+        } else {
+            // The ribbon closes the book: it is there also while no dish is shown.
+            canvas.ribbon(onRibbon());
+            Entry shown = hovered != null ? hovered : picked;
+            if (shown != null) {
+                drawDish(canvas, shown);
+            } else {
+                drawn.clear();
+                bar = null;
+            }
+        }
+        poseStack.popPose();
+    }
+
+    private void drawTabs(Sheet canvas) {
+        for (int i = 0; i < tabs.size(); i++) {
+            Tab shown = tabs.get(i);
+            canvas.tab(tabsX() + i * tabPitch(), Objects.equals(shown.kind(), tab), shown == hoveredTab, shown.icon());
+        }
+    }
+
+    private void drawList(Sheet canvas, int listPage) {
+        int first = listPage * PER_PAGE;
+        for (int i = first; i < Math.min(entries.size(), first + PER_PAGE); i++) {
+            Entry entry = entries.get(i);
+            int x = GRID_X + (i - first) % COLUMNS * PITCH;
+            int y = GRID_Y + (i - first) / COLUMNS * PITCH;
+            canvas.rect(x, y, WELL_SIZE, WELL_SIZE, WELL_LIFT, entry.isReady() ? WELL_READY : WELL);
+            canvas.item(entry.dish(), x + 0.5F, y + 0.5F, 16.0F, !entry.isReady());
+            if (entry == picked || entry == hovered) {
+                canvas.frame(x, y, WELL_SIZE);
+            }
+        }
+        if (pages() > 1) {
+            Font font = Minecraft.getInstance().font;
+            String number = String.valueOf(listPage + 1);
+            canvas.text(number, GRID_X + (COLUMNS * PITCH - (PITCH - WELL_SIZE) - font.width(number)) / 2.0F,
+                    ARROW_Y + (ARROW_HEIGHT - font.lineHeight) / 2.0F + 1.0F);
+            if (listPage > 0) {
+                canvas.arrow(GRID_X, ARROW_Y, false);
+            }
+            if (listPage < pages() - 1) {
+                canvas.arrow(GRID_X + COLUMNS * PITCH - (PITCH - WELL_SIZE) - ARROW_WIDTH, ARROW_Y, true);
+            }
+        }
+    }
+
+    /** The dish, its name, its stars, what goes in, how long it takes and what it is served in. */
+    private void drawDish(Sheet canvas, Entry entry) {
+        Font font = Minecraft.getInstance().font;
+        float middle = RIGHT_MIDDLE;
+        drawn.clear();
+        canvas.item(entry.dish(), middle - DISH_SIZE / 2.0F, 3.0F, DISH_SIZE);
+        drawn.add(new Drawn(middle - DISH_SIZE / 2.0F, 3.0F, DISH_SIZE, entry.dish()));
+        float line = 25.0F;
+        // Two lines at most: a long modded name must leave room for what goes in.
+        if (nameFor != entry) {
+            nameFor = entry;
+            nameLines = font.split(entry.dish().getHoverName(), Math.round(2.0F * (UNITS_WIDE - middle) - 6.0F));
+        }
+        List<FormattedCharSequence> name = nameLines;
+        for (FormattedCharSequence text : name.subList(0, Math.min(2, name.size()))) {
+            canvas.text(text, middle - font.width(text) / 2.0F, line);
+            line += font.lineHeight;
+        }
+        if (entry.page().stars()) {
+            drawStars(canvas, entry, middle, line);
+            line += font.lineHeight;
+        }
+        float rowWide = COLUMNS * PITCH - (PITCH - WELL_SIZE);
+        canvas.rect(middle - rowWide / 2.0F, line + 0.5F, rowWide, 0.6F, WELL_LIFT, RULE);
+        int count = entry.ingredients().size();
+        long second = Util.getMillis() / 1000L;
+        float top = line + 3.0F;
+        // The small print goes where there is room left, in the middle, on the line of the list's arrows.
+        float footMiddle = ARROW_Y + ARROW_HEIGHT / 2.0F;
+        float bottom = footMiddle - FOOT_SIZE / 2.0F;
+        int rows = (count + 2) / 3;
+        // As many rows as fit over the small print; with fewer than two there, the small print gives way to the ingredients. Rows
+        // that still do not fit are reached by the bar beside them, a whole row at a time.
+        int overFoot = Math.max(0, Mth.floor((bottom - top + PITCH - WELL_SIZE) / PITCH));
+        boolean withFoot = rows <= overFoot || overFoot >= 2;
+        int shown = withFoot ? Math.min(rows, overFoot) : Math.max(1, Math.min(rows, Mth.floor((PAGE_FOOT - top + PITCH - WELL_SIZE) / PITCH)));
+        if (!Objects.equals(rowsFor, entry.page().key())) {
+            if (picked != null && Objects.equals(rowsFor, picked.page().key())) {
+                pickedRowFor = rowsFor;
+                pickedRow = firstRow;
+            }
+            rowsFor = entry.page().key();
+            firstRow = Objects.equals(pickedRowFor, rowsFor) ? pickedRow : 0;
+        }
+        firstRow = Mth.clamp(firstRow, 0, rows - shown);
+        if (shown < rows) {
+            float high = shown * PITCH - (PITCH - WELL_SIZE);
+            float gripHigh = Math.max(BAR_LEAST, high * shown / rows);
+            float gripTop = top + (high - gripHigh) * firstRow / (rows - shown);
+            bar = new Bar(rows, shown, firstRow, top, high, gripTop, gripHigh);
+            canvas.rect(BAR_X, top, BAR_WIDE, high, WELL_LIFT, BAR_TRACK);
+            boolean lit = gripHeld >= 0.0F || cursorX >= UNITS_WIDE && bar.onGrip(cursorX - UNITS_WIDE, cursorY);
+            canvas.rect(BAR_X, gripTop, BAR_WIDE, gripHigh, WELL_LIFT + 0.05F, lit ? WELL_PICKED : BAR_GRIP);
+        } else {
+            bar = null;
+        }
+        for (int i = firstRow * 3; i < Math.min(count, (firstRow + shown) * 3); i++) {
+            int inRow = Math.min(3, count - i / 3 * 3);
+            float x = middle - (inRow * PITCH - (PITCH - WELL_SIZE)) / 2.0F + i % 3 * PITCH;
+            float y = top + (i / 3 - firstRow) * PITCH;
+            ItemStack[] choices = entry.ingredients().get(i).items().map(ItemStack::new).toArray(ItemStack[]::new);
+            if (choices.length > 0) {
+                canvas.rect(x, y, WELL_SIZE, WELL_SIZE, WELL_LIFT, entry.found()[i] ? WELL_READY : WELL);
+                ItemStack choice = choices[(int) (second % choices.length)];
+                canvas.item(choice, x + 0.5F, y + 0.5F, 16.0F, !entry.found()[i]);
+                drawn.add(new Drawn(x, y, WELL_SIZE, choice));
+            }
+        }
+        if (withFoot) {
+            List<ItemStack> foot = entry.page().foot();
+            FormattedCharSequence note = entry.page().note() == null ? null : entry.page().note().getVisualOrderText();
+            // The note stands close after the last thing, as a time after its clock.
+            float noteWide = note == null ? 0.0F : font.width(note) + 1.0F;
+            float wide = foot.isEmpty() ? noteWide : (foot.size() - 1) * FOOT_PITCH + FOOT_SIZE + noteWide;
+            float x = middle - wide / 2.0F;
+            for (ItemStack small : foot) {
+                canvas.item(small, x, bottom, FOOT_SIZE);
+                drawn.add(new Drawn(x, bottom, FOOT_SIZE, small));
+                x += FOOT_PITCH;
+            }
+            if (note != null) {
+                float noteX = foot.isEmpty() ? x : x - FOOT_PITCH + FOOT_SIZE + 1.0F;
+                canvas.text(note, noteX, footMiddle - font.lineHeight / 2.0F + 1.0F);
+            }
+        }
+    }
+
+    /**
+     * The stars the player can cook the dish with now and the most they add to a batch; the next star fills as they make more
+     * of it.
+     */
+    private void drawStars(Sheet canvas, Entry entry, float middle, float line) {
+        Font font = Minecraft.getInstance().font;
+        int open = PotLogic.openStars(entry.made());
+        FormattedCharSequence bonus = Component.translatable("handson_delight.book.bonus", PotLogic.bonusPercent(open)).getVisualOrderText();
+        int size = PotBehavior.STAR_SIZE;
+        float starsWide = 3 * size + 2;
+        float left = middle - (starsWide + 3 + font.width(bonus)) / 2.0F;
+        for (int star = 0; star < 3; star++) {
+            float x = left + star * (size + 1);
+            int earning = star == open ? Math.round(PotLogic.nextStar(entry.made()) * size) : 0;
+            for (int row = 0; row < size; row++) {
+                int color = star < open ? STAR_OPEN : row >= size - earning ? STAR_EARNING : STAR_SHUT;
+                for (int column = 0; column < size; column++) {
+                    if (PotBehavior.STAR[row].charAt(column) == '#') {
+                        canvas.rect(x + column, line + 1 + row, 1, 1, WELL_LIFT, color);
+                    }
+                }
+            }
+        }
+        canvas.text(bonus, left + starsWide + 3, line);
+    }
+
+    /** Drawing on a page. */
+    private final class Sheet {
+        private final PoseStack poseStack;
+        private final MultiBufferSource buffers;
+        private final TextureAtlasSprite white;
+
+        Sheet(PoseStack poseStack, MultiBufferSource buffers) {
+            this.poseStack = poseStack;
+            this.buffers = buffers;
+            white = Minecraft.getInstance().getAtlasManager().getAtlasOrThrow(net.minecraft.data.AtlasIds.BLOCKS).getSprite(WHITE);
+        }
+
+        void paper(boolean mirrored) {
+            VertexConsumer consumer = buffers.getBuffer(net.minecraft.client.renderer.rendertype.RenderTypes.text(PAPER));
+            quad(consumer, 0.0F, 0.0F, UNITS_WIDE, UNITS_HIGH, 0.0F, 0xFFFFFFFF, mirrored ? PAPER_U1 : 0.0F, mirrored ? 0.0F : PAPER_U1, 0.0F, PAPER_V1);
+        }
+
+        void rect(float x, float y, float width, float height, float lift, int argb) {
+            VertexConsumer consumer = buffers.getBuffer(net.minecraft.client.renderer.rendertype.RenderTypes.text(TextureAtlas.LOCATION_BLOCKS));
+            quad(consumer, x, y, x + width, y + height, lift, argb, white.getU0(), white.getU1(), white.getV0(), white.getV1());
+        }
+
+        /**
+         * A paper tab standing over the page's top edge, as vanilla's recipe book has them: the chosen one taller and in the page's own
+         * paper, the others a shade darker behind it, each with its kind's icon.
+         */
+        void tab(float x, boolean chosen, boolean lit, ItemStack icon) {
+            float high = chosen ? TAB_HIGH : TAB_HIGH - TAB_DROP;
+            int paper = chosen ? 0xFFFFFFFF : lit ? 0xFFEDE4D0 : 0xFFD6C9AC;
+            // Down into the page by a unit: the chosen one runs on into it, with no edge between.
+            float bottom = chosen ? 1.0F : 0.0F;
+            float u0 = TAB_PAPER_U / PAPER_SIZE;
+            float v0 = TAB_PAPER_V / PAPER_SIZE;
+            quad(buffers.getBuffer(net.minecraft.client.renderer.rendertype.RenderTypes.text(PAPER)), x, -high, x + TAB_WIDE, bottom, chosen ? 0.05F : 0.0F, paper, u0,
+                    u0 + TAB_WIDE / PAPER_SIZE, v0, v0 + (bottom + high) / PAPER_SIZE);
+            rect(x + 1.0F, -high, TAB_WIDE - 2.0F, 1.0F, 0.1F, TAB_EDGE);
+            rect(x, -high + 1.0F, 1.0F, high - 1.0F, 0.1F, TAB_EDGE);
+            rect(x + TAB_WIDE - 1.0F, -high + 1.0F, 1.0F, high - 1.0F, 0.1F, TAB_EDGE);
+            item(icon, x + (TAB_WIDE - TAB_ICON) / 2.0F, -high + 2.0F, TAB_ICON, !chosen && !lit);
+        }
+
+        /** The ribbon from the paper texture, its forked end frayed; lighter under the cursor. */
+        void ribbon(boolean lit) {
+            float u = (lit ? RIBBON_LIT_U : RIBBON_U) / PAPER_SIZE;
+            quad(buffers.getBuffer(net.minecraft.client.renderer.rendertype.RenderTypes.text(PAPER)), RIBBON_X, 0.0F, RIBBON_X + RIBBON_WIDTH, RIBBON_HEIGHT, COVER_LIFT, 0xFFFFFFFF, u,
+                    u + RIBBON_WIDTH / PAPER_SIZE, 0.0F, RIBBON_HEIGHT / PAPER_SIZE);
+        }
+
+        void frame(float x, float y, float size) {
+            rect(x, y, size, 1.0F, COVER_LIFT, WELL_PICKED);
+            rect(x, y + size - 1.0F, size, 1.0F, COVER_LIFT, WELL_PICKED);
+            rect(x, y, 1.0F, size, COVER_LIFT, WELL_PICKED);
+            rect(x + size - 1.0F, y, 1.0F, size, COVER_LIFT, WELL_PICKED);
+        }
+
+        /** Vanilla's page arrow: since 1.20.2 its own sprite, no longer in the book's texture. */
+        void arrow(float x, float y, boolean forward) {
+            boolean over = cursorX >= x && cursorX < x + ARROW_WIDTH && cursorY >= y && cursorY < y + ARROW_HEIGHT;
+            Identifier sprite = (forward ? (over ? PAGE_FORWARD_LIT : PAGE_FORWARD) : (over ? PAGE_BACKWARD_LIT : PAGE_BACKWARD));
+            quad(buffers.getBuffer(net.minecraft.client.renderer.rendertype.RenderTypes.text(sprite)), x, y, x + ARROW_WIDTH, y + ARROW_HEIGHT, WELL_LIFT, 0xFFFFFFFF, 0.0F, 1.0F, 0.0F, 1.0F);
+        }
+
+        private void quad(VertexConsumer consumer, float x0, float y0, float x1, float y1, float lift, int argb, float u0, float u1, float v0, float v1) {
+            Matrix4f matrix = poseStack.last().pose();
+            int a = argb >>> 24;
+            int r = argb >> 16 & 0xFF;
+            int g = argb >> 8 & 0xFF;
+            int b = argb & 0xFF;
+            consumer.addVertex(matrix, x0, y0, lift).setColor(r, g, b, a).setUv(u0, v0).setLight(shade);
+            consumer.addVertex(matrix, x0, y1, lift).setColor(r, g, b, a).setUv(u0, v1).setLight(shade);
+            consumer.addVertex(matrix, x1, y1, lift).setColor(r, g, b, a).setUv(u1, v1).setLight(shade);
+            consumer.addVertex(matrix, x1, y0, lift).setColor(r, g, b, a).setUv(u1, v0).setLight(shade);
+        }
+
+        void item(ItemStack stack, float x, float y, float size) {
+            item(stack, x, y, size, false);
+        }
+
+        /** {@code faded}: what the player does not have yet, the icon itself see-through, as nothing laid over it would stay in its place. */
+        void item(ItemStack stack, float x, float y, float size, boolean faded) {
+            poseStack.pushPose();
+            poseStack.translate(x + size / 2.0F, y + size / 2.0F, ITEM_LIFT);
+            ItemRenderer renderer = Minecraft.getInstance().getItemRenderer();
+            SceneModel model = SceneModel.item(stack, (net.minecraft.client.multiplayer.ClientLevel)station.level(), ItemDisplayContext.GUI);
+            Matrix3f facing = new Matrix3f(poseStack.last().normal());
+            poseStack.scale(size, -size, model.isGui3d() ? BLOCK_DEPTH : ITEM_DEPTH);
+            // As in the GUI, the flip and the depth leave the normals alone: IconLight lights the faces as the GUI does.
+            poseStack.last().normal().set(facing);
+            // The icon looks as in a GUI, but is drawn as no GUI item: mods that decorate every GUI item (Shadow Drop's shadows and
+            // its shift) take its world pose for a screen's and move or cover the icon.
+            SceneModel shown = ClientPlatform.INSTANCE.guiModel(model, poseStack);
+            MultiBufferSource lit = IconLight.of(buffers, facing, model.usesBlockLight());
+            shown.render(poseStack, faded ? DiegesisClient.tinted(lit, FADED) : lit, shade, OverlayTexture.NO_OVERLAY);
+            poseStack.popPose();
+        }
+
+        void text(String text, float x, float y) {
+            text(Component.literal(text).getVisualOrderText(), x, y);
+        }
+
+        void text(FormattedCharSequence text, float x, float y) {
+            Matrix4f matrix = new Matrix4f(poseStack.last().pose()).translate(0.0F, 0.0F, ITEM_LIFT);
+            Minecraft.getInstance().font.drawInBatch(text, x, y, INK, false, matrix, buffers, Font.DisplayMode.NORMAL, 0, shade);
+        }
+    }
+}

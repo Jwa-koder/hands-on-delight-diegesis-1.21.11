@@ -1,0 +1,68 @@
+plugins {
+    id 'fabric-loom' version '1.17.19'
+    id 'maven-publish'
+}
+version = '1.0.0-beta.11-port.1'
+group = 'com.pockyl.diegesis'
+base { archivesName = 'diegesis-fabric-1.21.11' }
+repositories { mavenCentral() }
+dependencies {
+    minecraft 'com.mojang:minecraft:1.21.11'
+    mappings loom.officialMojangMappings()
+    modImplementation 'net.fabricmc:fabric-loader:0.20.1'
+    modImplementation 'net.fabricmc.fabric-api:fabric-api:0.141.6+1.21.11'
+}
+sourceSets.main {
+    java.srcDirs = ['common/src/main/java', 'fabric/src/main/java']
+    java.exclude '**/SableSubLevels.java'
+    resources.srcDirs = ['common/src/main/resources', 'fabric/src/main/resources']
+}
+java { toolchain.languageVersion = JavaLanguageVersion.of(21); withSourcesJar() }
+def portVersion = project.version.toString()
+processResources {
+    inputs.property 'version', project.version
+    filesMatching('fabric.mod.json') {
+        expand minecraft_version: '1.21.11', fabric_loader_version: '0.19.5', fabric_api_version: '0.141.6', mod_id: 'diegesis', mod_name: 'Diegesis (Unofficial 1.21.11 Port)', mod_license: 'MIT', mod_version: portVersion, mod_authors: 'Pocky', mod_description: 'Unofficial port of Diegesis to Fabric 1.21.11.', mod_url: 'https://github.com/Pocky-l/diegesis'
+    }
+}
+jar { from('LICENSE') { rename { 'LICENSE_diegesis' } } }
+
+tasks.withType(JavaCompile).configureEach { options.compilerArgs += ['-Xmaxerrs', '2000'] }
+
+loom { accessWidenerPath = file('fabric/src/main/resources/diegesis.accesswidener') }
+
+dependencies {
+    testImplementation platform('org.junit:junit-bom:5.12.2')
+    testImplementation 'org.junit.jupiter:junit-jupiter'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
+}
+test { useJUnitPlatform() }
+
+// A separate test mod drives the real client, renderer, integrated server and networking.
+// None of this source set is included in the published library JAR.
+fabricApi.configureTests {
+    createSourceSet = true
+    modId = 'diegesis_smoke_test'
+    enableGameTests = false
+    enableClientGameTests = true
+    clearRunDirectory = false
+    username = 'DiegesisTest'
+}
+sourceSets.gametest {
+    java.srcDirs = ['src/clientTest/java']
+    resources.srcDirs = ['src/clientTest/resources']
+}
+
+// Integration runs use the original Farmer's Delight release, never the compile-only compatibility copy.
+if (providers.gradleProperty('portIntegration').isPresent()) {
+    dependencies {
+        modRuntimeOnly files(providers.gradleProperty('portFdJar').get())
+        modRuntimeOnly files(providers.gradleProperty('portAddonJar').get())
+    }
+}
+// Report startup errors to the test log and exit instead of waiting in Fabric's error dialog.
+loom.runs.named('clientGameTest') {
+    property 'fabric.noGui'
+    // Diegesis packet handlers schedule station updates outside the harness's packet boundary.
+    property 'fabric.client.gametest.disableNetworkSynchronizer', 'true'
+}

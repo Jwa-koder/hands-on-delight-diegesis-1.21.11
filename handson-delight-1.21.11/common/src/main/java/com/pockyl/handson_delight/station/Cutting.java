@@ -1,0 +1,261 @@
+package com.pockyl.handson_delight.station;
+
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.util.Mth;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.item.BlockItem;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.ShearsItem;
+
+import net.minecraft.world.item.TridentItem;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.CakeBlock;
+import vectorwing.farmersdelight.common.block.PieBlock;
+import vectorwing.farmersdelight.common.crafting.CookingPotRecipe;
+import vectorwing.farmersdelight.common.crafting.CuttingBoardRecipe;
+
+import com.pockyl.handson_delight.FarmersDelightContent;
+import com.pockyl.handson_delight.KitchenTags;
+import com.pockyl.handson_delight.assembly.AssemblyRecipes;
+import com.pockyl.handson_delight.platform.Platform;
+
+import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.IdentityHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
+import java.util.WeakHashMap;
+
+/** Farmer's Delight's cutting recipes, read for the board's station: what an item is cut with and into how many strokes. */
+public final class Cutting {
+    /**
+     * The most marks an item gets, one for each piece it falls into up to a limit: a cake into seven is
+     * cut three times, never more.
+     */
+    public static final int MOST_MARKS = 3;
+    /** Strips of pasta: this many cuts side by side, whatever comes out. */
+    private static final int STRIPS = 3;
+    /**
+     * Per recipe manager: the client's and the server's of a single-player game are two. Read again when the manager's map of
+     * recipes is a new one (a reload, a server's recipes): looked up every frame at the board, so never built anew in between.
+     */
+    private static final Map<com.pockyl.handson_delight.compat.Recipes.View, Cached> CACHE = new WeakHashMap<>();
+
+    private Cutting() {
+    }
+
+    /**
+     * Every cutting recipe, Farmer's Delight's and its addons', by id. Never in the recipe manager's order: on 1.20.1 a client keeps
+     * its recipes in hash maps of their own, so its order differs from its server's, and an item two recipes cut (raw chicken, by
+     * Farmer's Delight and by PizzaCraft) got two marks on the client and three on the server, and stayed whole (GitHub #26).
+     */
+    public static List<CuttingBoardRecipe> everything(Level level) {
+        return cached(level).everything();
+    }
+
+    /**
+     * Every cutting recipe, the board's station: cooking first (see {@link #isCooking}), then the rest (a log stripped with an axe, a
+     * flower cut into dye, leather armour cut into leather, an addon's moulds). A board that took only food left players with a leather
+     * armour lying on it and no station, and every cut goes through it now; the book keeps the kitchen in front.
+     */
+    public static List<CuttingBoardRecipe> all(Level level) {
+        return cached(level).ordered();
+    }
+
+    private static Cached cached(Level level) {
+        return cached(com.pockyl.handson_delight.compat.Recipes.manager(level), level);
+    }
+
+    /** The cutting recipes of {@code manager}, which need not be the level's: a test reads them as a client would. */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    private static Cached cached(com.pockyl.handson_delight.compat.Recipes.View manager, Level level) {
+        java.util.Collection<RecipeHolder<?>> recipes = manager.getRecipes();
+        synchronized (CACHE) {
+            Cached cached = CACHE.get(manager);
+            if (cached == null || cached.from() != recipes) {
+                List<CuttingBoardRecipe> everything = new ArrayList<>();
+                Map<CuttingBoardRecipe, Identifier> ids = new IdentityHashMap<>();
+                List<RecipeHolder<?>> found = manager.getAllRecipesFor((RecipeType) FarmersDelightContent.CUTTING.get());
+                for (RecipeHolder<?> holder : found) {
+                    if (holder.value() instanceof CuttingBoardRecipe cutting && !com.pockyl.handson_delight.compat.Recipes.ingredients(cutting).isEmpty()) {
+                        everything.add(cutting);
+                        ids.put(cutting, holder.id().identifier());
+                    }
+                }
+                everything.sort(Comparator.comparing(ids::get));
+                List<CookingPotRecipe> pot = Platform.INSTANCE.cookingRecipes(level).stream().map(RecipeHolder::value).toList();
+                List<CuttingBoardRecipe> ordered = new ArrayList<>(everything.stream().filter(recipe -> isCooking(recipe, pot)).toList());
+                everything.stream().filter(recipe -> !ordered.contains(recipe)).forEach(ordered::add);
+                cached = new Cached(recipes, List.copyOf(everything), List.copyOf(ordered), ids);
+                CACHE.put(manager, cached);
+            }
+            return cached;
+        }
+    }
+
+    /**
+     * Whether {@code recipe} is cooking, with {@code pot} the cooking pot's recipes: food goes in or comes out, what comes out goes
+     * into the pot (rice, mushrooms, pasta), or a knife cuts what the pot serves its meals on (Fright's Delight's bone into the skewers
+     * of its kebabs). Cooking comes first in the board's book.
+     */
+    public static boolean isCooking(CuttingBoardRecipe recipe, List<CookingPotRecipe> pot) {
+        for (ItemStack input : com.pockyl.handson_delight.compat.Recipes.items(com.pockyl.handson_delight.compat.Recipes.ingredients(recipe).get(0))) {
+            if (input.has(DataComponents.FOOD)) {
+                return true;
+            }
+        }
+        List<ItemStack> results = recipe.getResults();
+        for (ItemStack result : results) {
+            if (result.has(DataComponents.FOOD) || pot.stream().anyMatch(cooking -> com.pockyl.handson_delight.compat.Recipes.ingredients(cooking).stream().anyMatch(in -> in.test(result)))) {
+                return true;
+            }
+        }
+        // A knife that cuts something into nothing but what the pot serves on makes skewers. A bush cut into sticks with an axe, a
+        // basket taken apart into canvas and a stick, a plant cut into a stick and gunpowder are no cooking, though a stick holds a
+        // marshmallow from the pot.
+        ItemStack knife = new ItemStack(BuiltInRegistries.ITEM.getValue(FarmersDelightContent.id("iron_knife")));
+        return !results.isEmpty() && tool(recipe).test(knife) && results.stream().allMatch(result -> pot.stream()
+                .map(CookingPotRecipe::container).anyMatch(container -> !container.isEmpty() && container.is(result.getItem())));
+    }
+
+    /** The cutting recipes read from a recipe manager's map of recipes, as long as the map is the same one. */
+    private record Cached(java.util.Collection<RecipeHolder<?>> from, List<CuttingBoardRecipe> everything, List<CuttingBoardRecipe> ordered,
+                          Map<CuttingBoardRecipe, Identifier> ids) {
+    }
+
+    /** The id {@code recipe} is known by, now that a recipe holds none of its own. */
+    public static Identifier id(Level level, CuttingBoardRecipe recipe) {
+        return cached(level).ids().get(recipe);
+    }
+
+    public static List<CuttingBoardRecipe> recipesFor(Level level, ItemStack item) {
+        return recipesFor(all(level), item);
+    }
+
+    private static List<CuttingBoardRecipe> recipesFor(List<CuttingBoardRecipe> all, ItemStack item) {
+        List<CuttingBoardRecipe> found = new ArrayList<>();
+        if (!item.isEmpty()) {
+            all.stream().filter(recipe -> com.pockyl.handson_delight.compat.Recipes.ingredients(recipe).get(0).test(item)).forEach(found::add);
+        }
+        return found;
+    }
+
+    /** How the marks of an item lie on it. */
+    public enum Style {
+        /** Across its length, a little askew each time: meat, fish, a cabbage. */
+        ACROSS,
+        /** Square across its length, in even slices: a roll. */
+        STRAIGHT,
+        /** Through its middle, crossing each other: a pie, a cake. */
+        WEDGES,
+        /** Square across, close side by side: pasta from dough. */
+        STRIPS
+    }
+
+    /**
+     * How {@code item} is cut: in how many marks, laid how. Both sides read the same recipes (by id, see {@link #everything}) and tags,
+     * so they agree.
+     */
+    public record Plan(int marks, Style style) {
+    }
+
+    public static Plan plan(Level level, ItemStack item) {
+        return plan(com.pockyl.handson_delight.compat.Recipes.manager(level), level, item);
+    }
+
+    /** {@link #plan(Level, ItemStack)} by the recipes of {@code manager}: a test plans as a client would. */
+    public static Plan plan(com.pockyl.handson_delight.compat.Recipes.View manager, Level level, ItemStack item) {
+        Style style = item.is(KitchenTags.CUT_IN_WEDGES) || isRound(item) ? Style.WEDGES
+                : item.is(KitchenTags.CUT_IN_STRIPS) ? Style.STRIPS
+                : item.is(KitchenTags.SLICED_STRAIGHT) ? Style.STRAIGHT : Style.ACROSS;
+        if (style == Style.STRIPS) {
+            return new Plan(STRIPS, style);
+        }
+        int pieces = recipesFor(cached(manager, level).ordered(), item).stream().findFirst().map(Cutting::pieces).orElse(2);
+        // n cuts across make n + 1 pieces; n cuts through the middle make 2n wedges.
+        int marks = style == Style.WEDGES ? (pieces + 1) / 2 : pieces - 1;
+        return new Plan(Mth.clamp(marks, 1, MOST_MARKS), style);
+    }
+
+    /** A pie or a cake put down whole, an addon's too: cut in wedges like Farmer's Delight's. */
+    private static boolean isRound(ItemStack item) {
+        return item.getItem() instanceof BlockItem block && (block.getBlock() instanceof PieBlock || block.getBlock() instanceof CakeBlock);
+    }
+
+    /** What an item falls into: the main result as many as it gives, and one piece for each thing besides (the bone of a ham). */
+    static int pieces(CuttingBoardRecipe recipe) {
+        List<ItemStack> results = recipe.getResults();
+        if (results.isEmpty()) {
+            return 2;
+        }
+        return results.get(0).getCount() + results.size() - 1;
+    }
+
+    /**
+     * The inventory slot whose tool cuts {@code item}: the one in hand first, then the off hand, the hotbar and the rest; -1 without
+     * one.
+     */
+    public static int toolSlot(Level level, ItemStack item, Inventory inventory) {
+        // The item's cuts are looked up once, not once a slot: the board offers the knife every frame.
+        List<CuttingBoardRecipe> recipes = recipesFor(level, item);
+        if (findWith(recipes, inventory.getSelectedItem()).isPresent()) {
+            return inventory.getSelectedSlot();
+        }
+        if (findWith(recipes, inventory.getItem(Inventory.SLOT_OFFHAND)).isPresent()) {
+            return Inventory.SLOT_OFFHAND;
+        }
+        for (int slot = 0; slot < Inventory.INVENTORY_SIZE; slot++) {
+            if (findWith(recipes, inventory.getItem(slot)).isPresent()) {
+                return slot;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * Whether {@code item} can be stuck into the board, as Farmer's Delight's own sneaking use does it: a tool with a tier (a knife,
+     * a sword, an axe), a trident or shears.
+     */
+    public static boolean canStick(ItemStack item) {
+        return item.has(DataComponents.TOOL) || item.is(net.minecraft.tags.ItemTags.SWORDS) || item.getItem() instanceof TridentItem || item.getItem() instanceof ShearsItem;
+    }
+
+    /** Whether {@code item} is what some cutting recipe cuts with: a knife, an axe, an addon's rolling pin. */
+    public static boolean isTool(Level level, ItemStack item) {
+        return !item.isEmpty() && everything(level).stream().anyMatch(recipe -> tool(recipe).test(item));
+    }
+
+    /**
+     * Whether {@code item} on the cursor is the board's tool, never laid down: a thing some cut is made with that cuts {@code onBoard},
+     * or that goes into none of {@code dishes} as a layer. An addon cutting a mould with a glass bottle (Fright's Delight) or a pod with
+     * a stick (Immortaler's Delight) leaves the bottle and the stick the first layers of drinks and skewers; a knife is no layer and
+     * knocks. The server passes its dishes, a client those its server sent: both decide alike.
+     */
+    public static boolean isTool(Level level, ItemStack item, ItemStack onBoard, List<AssemblyRecipes.Assembly> dishes) {
+        return isTool(level, item) && (findWith(level, onBoard, item).isPresent()
+                || dishes.stream().noneMatch(dish -> dish.ingredients().stream().anyMatch(ingredient -> ingredient.test(item))));
+    }
+
+    /**
+     * What {@code recipe} cuts with, to test a tool by and to show: through {@link Platform#unwrap}, as an addon's tool action on
+     * Refabricated throws when it is tested as Fabric wraps it.
+     */
+    public static Ingredient tool(CuttingBoardRecipe recipe) {
+        return Platform.INSTANCE.unwrap(recipe.getTool());
+    }
+
+    public static Optional<CuttingBoardRecipe> findWith(Level level, ItemStack item, ItemStack tool) {
+        return tool.isEmpty() ? Optional.empty() : findWith(recipesFor(level, item), tool);
+    }
+
+    /** The first of an item's {@code recipes} ({@link #recipesFor}) that {@code tool} cuts. */
+    public static Optional<CuttingBoardRecipe> findWith(List<CuttingBoardRecipe> recipes, ItemStack tool) {
+        return tool.isEmpty() ? Optional.empty() : recipes.stream().filter(recipe -> tool(recipe).test(tool)).findFirst();
+    }
+}

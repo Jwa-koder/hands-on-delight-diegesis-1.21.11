@@ -1,0 +1,10 @@
+Unofficial Fabric 1.21.11 ports of Pocky's MIT-licensed Diegesis and Hands-On Delight.
+Use Java 21. Both projects use Gradle wrapper 9.6.1 and Loom 1.17.19.
+Keep the two extracted project folders side by side.
+1. In diegesis-1.21.11: sh ./gradlew build
+2. In handson-delight-1.21.11: sh ./gradlew build
+The addon compiles against the library's named dev JAR built in step 1.
+Dependencies download from their public Maven repositories.
+The library's runClientGameTest task runs a separate test mod (not packaged).
+Actual-addon tests require -PportIntegration -PportFdJar=/absolute/path/to/official-FD.jar -PportAddonJar=/absolute/path/to/built-addon.jar.
+Original sources: https://github.com/Pocky-l/diegesis and https://github.com/Pocky-l/handson-delight

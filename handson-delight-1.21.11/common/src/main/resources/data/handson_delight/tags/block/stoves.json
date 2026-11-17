@@ -1,0 +1,21 @@
+{
+  "replace": false,
+  "values": [
+    {
+      "id": "farmersdelight:stove",
+      "required": false
+    },
+    {
+      "id": "ends_delight:end_stove",
+      "required": false
+    },
+    {
+      "id": "mynethersdelight:nether_stove",
+      "required": false
+    },
+    {
+      "id": "dungeonsdelight:dungeon_stove",
+      "required": false
+    }
+  ]
+}

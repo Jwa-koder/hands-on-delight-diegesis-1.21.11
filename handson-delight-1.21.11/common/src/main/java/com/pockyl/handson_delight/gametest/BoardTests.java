@@ -1,0 +1,1569 @@
+package com.pockyl.handson_delight.gametest;
+
+import com.google.gson.JsonElement;
+import com.google.gson.JsonPrimitive;
+import com.mojang.serialization.DynamicOps;
+import com.mojang.serialization.JsonOps;
+import net.minecraft.core.BlockPos;
+import net.minecraft.core.Direction;
+import net.minecraft.core.HolderLookup;
+import net.minecraft.core.NonNullList;
+import net.minecraft.core.component.DataComponentType;
+import net.minecraft.core.component.DataComponents;
+import net.minecraft.core.registries.BuiltInRegistries;
+import net.minecraft.gametest.framework.GameTestHelper;
+import net.minecraft.nbt.CompoundTag;
+import net.minecraft.network.chat.Component;
+import net.minecraft.resources.Identifier;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.util.Mth;
+import net.minecraft.world.InteractionHand;
+import net.minecraft.world.entity.item.ItemEntity;
+import net.minecraft.world.entity.player.Inventory;
+import net.minecraft.world.entity.player.Player;
+import net.minecraft.world.inventory.AbstractContainerMenu;
+import net.minecraft.world.inventory.ContainerLevelAccess;
+import net.minecraft.world.inventory.CraftingMenu;
+import net.minecraft.world.inventory.TransientCraftingContainer;
+import net.minecraft.world.item.Item;
+import net.minecraft.world.item.ItemStack;
+import net.minecraft.world.item.Items;
+import net.minecraft.world.item.alchemy.PotionContents;
+import net.minecraft.world.item.alchemy.Potions;
+import net.minecraft.world.item.crafting.CraftingBookCategory;
+import net.minecraft.world.item.crafting.CraftingRecipe;
+import net.minecraft.world.item.crafting.Ingredient;
+import net.minecraft.world.item.crafting.RecipeHolder;
+import net.minecraft.world.item.crafting.RecipeManager;
+import net.minecraft.world.item.crafting.RecipeType;
+import net.minecraft.world.item.crafting.ShapelessRecipe;
+import net.minecraft.world.level.GameType;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.phys.AABB;
+import vectorwing.farmersdelight.client.recipebook.CookingPotRecipeBookTab;
+import vectorwing.farmersdelight.common.block.entity.CuttingBoardBlockEntity;
+import vectorwing.farmersdelight.common.crafting.CookingPotRecipe;
+import vectorwing.farmersdelight.common.crafting.CuttingBoardRecipe;
+import vectorwing.farmersdelight.common.crafting.ingredient.ChanceResult;
+
+import com.pockyl.diegesis.api.state.StationState;
+import com.pockyl.diegesis.api.station.StationContext;
+import com.pockyl.diegesis.api.station.StationType;
+import com.pockyl.handson_delight.FarmersDelightContent;
+import com.pockyl.handson_delight.HandsOnDelight;
+import com.pockyl.handson_delight.assembly.Assembling;
+import com.pockyl.handson_delight.assembly.AssemblyRecipes;
+import com.pockyl.handson_delight.platform.Platform;
+import com.pockyl.handson_delight.station.BoardLayers;
+import com.pockyl.handson_delight.station.BoardLogic;
+import com.pockyl.handson_delight.station.Cutting;
+import com.pockyl.handson_delight.station.CuttingBoardStation;
+import com.pockyl.handson_delight.station.KitchenBoard;
+
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Optional;
+import java.util.UUID;
+
+/** The cutting board's rules against a real board of Farmer's Delight, on every loader, like {@link PotTests}. */
+public final class BoardTests {
+    private BoardTests() {
+    }
+
+    private static Item fd(String path) {
+        return BuiltInRegistries.ITEM.getValue(FarmersDelightContent.id(path));
+    }
+
+    /** A board, the logic the station would make for it, and a cook holding nothing. */
+    private record Board(Station station, BoardLogic logic, CuttingBoardBlockEntity board, Player cook, ItemStack knife) {
+        void carry(ItemStack stack) {
+            cook.inventoryMenu.setCarried(stack);
+        }
+
+        void act(String action, CompoundTag data) {
+            logic.onCustomAction(station, cook, action, data);
+        }
+
+        void place() {
+            act(CuttingBoardStation.ACTION_PLACE, new CompoundTag());
+        }
+
+        void chop(int mark) {
+            if (cook.inventoryMenu.getCarried().isEmpty()) {
+                carry(knife);
+            }
+            CompoundTag at = new CompoundTag();
+            at.putInt(CuttingBoardStation.MARK, mark);
+            at.putFloat(CuttingBoardStation.AT, mark == 0 ? 10.0F : 6.0F);
+            act(CuttingBoardStation.ACTION_CHOP, at);
+        }
+
+        int layers() {
+            return BoardLogic.layers(station.state()).size();
+        }
+
+        /**
+         * A dish that could still grow into a bigger one waits for the cook's word (addons add bigger burgers, salads and cookies):
+         * given here when it waits.
+         */
+        void finishIfItWaits() {
+            if (layers() > 0) {
+                act(CuttingBoardStation.ACTION_ASSEMBLE, new CompoundTag());
+            }
+        }
+
+        ItemStack onBoard() {
+            return Platform.INSTANCE.getItem(board);
+        }
+    }
+
+    private static Board board(GameTestHelper helper) {
+        return board(helper, new BlockPos(1, 1, 1));
+    }
+
+    private static Board board(GameTestHelper helper, BlockPos at) {
+        helper.setBlock(at, FarmersDelightContent.CUTTING_BOARD.get());
+        BlockPos pos = helper.absolutePos(at);
+        Station station = new Station(helper.getLevel(), pos);
+        CuttingBoardBlockEntity board = (CuttingBoardBlockEntity) helper.getLevel().getBlockEntity(pos);
+        // A server player: Refabricated's board hands what it cuts to one.
+        ServerPlayer cook = TestPlayers.serverPlayer(helper, "cook");
+        cook.setGameMode(GameType.CREATIVE);
+        return new Board(station, new BoardLogic(station), board, cook, new ItemStack(fd("iron_knife")));
+    }
+
+    /**
+     * A burger is put together on the board: a player's crafting grid does not make it and the recipe book does not learn it; the grid
+     * of a machine (an autocrafter in a modpack) still makes it.
+     */
+    public static void burgersLeaveTheCraftingTable(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        ServerPlayer cook = TestPlayers.withTheMod(helper, "cook");
+        CraftingMenu table = new CraftingMenu(0, cook.getInventory(), ContainerLevelAccess.create(level, helper.absolutePos(BlockPos.ZERO)));
+        for (int slot = 0; slot < 5; slot++) {
+            table.getSlot(1 + slot).set(burger().get(slot));
+        }
+        helper.assertTrue(table.getSlot(0).getItem().isEmpty(), "the crafting table makes no hamburger");
+        TransientCraftingContainer machine = new TransientCraftingContainer(new MachineMenu(), 3, 3);
+        for (int slot = 0; slot < 5; slot++) {
+            machine.setItem(slot, burger().get(slot));
+        }
+        helper.assertTrue(com.pockyl.handson_delight.compat.Recipes.manager(level).getRecipeFor(RecipeType.CRAFTING, machine.asCraftInput(), level)
+                .filter(recipe -> com.pockyl.handson_delight.compat.Recipes.result(recipe.value(), level.registryAccess()).is(fd("hamburger"))).isPresent(),
+                "an autocrafter still does");
+        RecipeHolder<?> hamburger = com.pockyl.handson_delight.compat.Recipes.manager(level).byKey(FarmersDelightContent.id("hamburger")).orElseThrow();
+        helper.assertTrue(cook.getRecipeBook().addRecipes(List.of(hamburger), cook) == 0 && !cook.getRecipeBook().contains(hamburger),
+                "and the recipe book does not learn it");
+        helper.assertTrue(AssemblyRecipes.all().stream().anyMatch(dish -> dish.id().getPath().equals("hamburger")), "the board does");
+        helper.assertTrue(com.pockyl.handson_delight.compat.Recipes.manager(level).byKey(FarmersDelightContent.id("cooking_pot")).isPresent(), "blocks are still crafted");
+        helper.succeed();
+    }
+
+    /**
+     * Plated meals and salads go down from the bowl up. What is one kind of thing put back together (slices into a pie, leaves into
+     * a cabbage) and what is no food (horse feed, milk bottles) stays in the crafting table.
+     */
+    public static void bowlDishesLeaveTheCraftingTable(GameTestHelper helper) {
+        for (String dish : List.of("bacon_and_eggs", "steak_and_potatoes", "roasted_mutton_chops", "grilled_salmon", "mixed_salad",
+                "fruit_salad", "nether_salad")) {
+            helper.assertTrue(made(dish).filter(it -> it.kind() == AssemblyRecipes.Base.BOWL).isPresent(), dish + " starts from its bowl");
+        }
+        for (String crafted : List.of("apple_pie_from_slices", "cabbage_from_leaves", "horse_feed", "milk_bottle", "cooking_pot")) {
+            helper.assertTrue(made(crafted).isEmpty(), crafted + " stays in the crafting table");
+        }
+        Level level = helper.getLevel();
+        helper.assertTrue(tableMakes(helper, netherSalad()).isEmpty(), "the table makes no salad");
+        TransientCraftingContainer machine = new TransientCraftingContainer(new MachineMenu(), 3, 3);
+        netherSalad().forEach(machine::setItem);
+        helper.assertTrue(com.pockyl.handson_delight.compat.Recipes.manager(level).getRecipeFor(RecipeType.CRAFTING, machine.asCraftInput(), level).isPresent(),
+                "an autocrafter does");
+        helper.succeed();
+    }
+
+    /** What a player's crafting table shows as its result with {@code grid} (slot, stack) in it. */
+    private static ItemStack tableMakes(GameTestHelper helper, Map<Integer, ItemStack> grid) {
+        ServerPlayer cook = TestPlayers.withTheMod(helper, "cook");
+        CraftingMenu table = new CraftingMenu(0, cook.getInventory(),
+                ContainerLevelAccess.create(helper.getLevel(), helper.absolutePos(BlockPos.ZERO)));
+        grid.forEach((slot, stack) -> table.getSlot(1 + slot).set(stack));
+        return table.getSlot(0).getItem();
+    }
+
+    private static Optional<AssemblyRecipes.Assembly> made(String path) {
+        return AssemblyRecipes.all().stream().filter(dish -> dish.id().equals(FarmersDelightContent.id(path))).findFirst();
+    }
+
+    /**
+     * Whether an addon makes Farmer's Delight's {@code path} elsewhere than at the crafting table: Cultural Delights 0.19 on 1.21.1
+     * bakes its pies and stuffed potato in its oven. There is no craft to put together then, and the board rightly has no dish.
+     */
+    private static boolean madeElsewhere(GameTestHelper helper, String path) {
+        return helper.getLevel().getRecipeManager().byKey(FarmersDelightContent.id(path))
+                .filter(holder -> !(holder.value() instanceof CraftingRecipe)).isPresent();
+    }
+
+    private static Map<Integer, ItemStack> netherSalad() {
+        return Map.of(0, new ItemStack(Items.CRIMSON_FUNGUS), 1, new ItemStack(Items.WARPED_FUNGUS), 4, new ItemStack(Items.BOWL));
+    }
+
+    /**
+     * A modpack brings a craft of any mod, datapack or script to the board by tagging its result {@code handson_delight:assembled}.
+     * The board reads such a craft as the recipe manager loaded it, shaped ones keeping their shape; untagged, a vanilla food craft
+     * stays in the crafting table. With KubeJS ({@code -Pkubejs}) the test script adds such a recipe and the tag, as a modpack does.
+     */
+    public static void aTaggedCraftOfAnyModComesToTheBoard(GameTestHelper helper) {
+        RecipeManager recipes = helper.getLevel().getRecipeManager();
+        HolderLookup.Provider registries = helper.getLevel().registryAccess();
+        // Cultural Delights takes the stew, the cake and the bread off the crafting table (into its pot and its oven): then there is no
+        // craft of them to read.
+        recipes.byKey(Identifier.parse("minecraft:mushroom_stew")).ifPresent(craft -> {
+            AssemblyRecipes.Assembly stew = AssemblyRecipes.fromCraft(craft, registries).orElseThrow();
+            helper.assertTrue(stew.kind() == AssemblyRecipes.Base.BOWL && stew.result().is(Items.MUSHROOM_STEW)
+                    && stew.ingredients().size() == 3, "a shapeless craft is read with its ingredients and result");
+        });
+        recipes.byKey(Identifier.parse("minecraft:cake")).ifPresent(craft -> {
+            AssemblyRecipes.Assembly cake = AssemblyRecipes.fromCraft(craft, registries).orElseThrow();
+            helper.assertTrue(cake.result().is(Items.CAKE) && cake.ingredients().size() == 9 && cake.kind() == AssemblyRecipes.Base.WHEAT,
+                    "a shaped craft keeps its shape");
+        });
+        recipes.byKey(Identifier.parse("minecraft:bread")).ifPresent(craft -> helper.assertTrue(
+                AssemblyRecipes.fromCraft(craft, registries).isEmpty(), "one kind of thing is no dish"));
+        if (Platform.INSTANCE.isLoaded("kubejs")) {
+            helper.assertTrue(AssemblyRecipes.isMadeOnTheBoard(Identifier.parse("kubejs:fungus_stew")),
+                    "a script's recipe with a tagged result is made on the board");
+            helper.assertTrue(AssemblyRecipes.isMadeOnTheBoard(Identifier.parse("minecraft:mushroom_stew")),
+                    "and so is every craft of that result");
+        } else {
+            helper.assertTrue(!AssemblyRecipes.isMadeOnTheBoard(Identifier.parse("minecraft:mushroom_stew")),
+                    "an untagged vanilla dish stays in the crafting table");
+        }
+        helper.succeed();
+    }
+
+    /**
+     * A craft with a water bottle (Delightful's dough of flour and water) leaves the cook the empty bottle, as one with a water bucket
+     * leaves the bucket, though the crafting table keeps it: water is poured, the glass stays in the hand.
+     */
+    public static void aPouredWaterBottleLeavesItsBottle(GameTestHelper helper) {
+        ItemStack water = PotionContents.createItemStack(Items.POTION, Potions.WATER);
+        Item dough = BuiltInRegistries.ITEM.getValue(FarmersDelightContent.id("wheat_dough"));
+        ShapelessRecipe craft = new ShapelessRecipe("", CraftingBookCategory.MISC, new ItemStack(dough, 3), NonNullList.of(Ingredient.of(java.util.stream.Stream.<net.minecraft.world.level.ItemLike>empty()),
+                Ingredient.of(Items.WHEAT), Ingredient.of(Items.WHEAT), Ingredient.of(Items.WHEAT), Ingredient.of(water)));
+        AssemblyRecipes.Assembly dish = AssemblyRecipes.fromCraft(new RecipeHolder<>(HandsOnDelight.id("test_dough_from_water_bottle"), craft),
+                helper.getLevel().registryAccess()).orElseThrow();
+        List<ItemStack> layers = new ArrayList<>();
+        layers.add(new ItemStack(Items.WHEAT));
+        layers.add(new ItemStack(Items.WHEAT));
+        layers.add(water.copy());
+        layers.add(new ItemStack(Items.WHEAT));
+        Assembling.Made made = Assembling.make(dish, layers, helper.getLevel(), 1);
+        helper.assertTrue(made.rounds() == 1 && made.dishes().size() == 1 && made.dishes().get(0).is(dough), "the dough is made");
+        helper.assertTrue(made.leftovers().size() == 1 && made.leftovers().get(0).is(Items.GLASS_BOTTLE)
+                && made.layers().stream().allMatch(ItemStack::isEmpty), "the water is poured in and its bottle goes back to the cook");
+        helper.succeed();
+    }
+
+    /** Every other kind of FD food craft goes onto the board too, each starting from what goes down first. */
+    public static void everyFoodCraftComesToTheBoard(GameTestHelper helper) {
+        Map<String, AssemblyRecipes.Base> kinds = Map.ofEntries(Map.entry("kelp_roll", AssemblyRecipes.Base.KELP),
+                Map.entry("cod_roll", AssemblyRecipes.Base.RICE), Map.entry("salmon_roll", AssemblyRecipes.Base.RICE),
+                Map.entry("barbecue_stick", AssemblyRecipes.Base.STICK), Map.entry("melon_popsicle", AssemblyRecipes.Base.STICK),
+                Map.entry("wheat_dough_from_egg", AssemblyRecipes.Base.WHEAT),
+                Map.entry("wheat_dough_from_water", AssemblyRecipes.Base.WHEAT),
+                Map.entry("pie_crust", AssemblyRecipes.Base.WHEAT), Map.entry("honey_cookie", AssemblyRecipes.Base.WHEAT),
+                Map.entry("sweet_berry_cookie", AssemblyRecipes.Base.WHEAT), Map.entry("cake_from_milk_bottle", AssemblyRecipes.Base.WHEAT),
+                Map.entry("apple_pie", AssemblyRecipes.Base.CRUST), Map.entry("chocolate_pie", AssemblyRecipes.Base.CRUST),
+                Map.entry("sweet_berry_cheesecake", AssemblyRecipes.Base.CRUST),
+                Map.entry("pumpkin_pie_from_pie_crust", AssemblyRecipes.Base.CRUST), Map.entry("melon_juice", AssemblyRecipes.Base.BOTTLE),
+                Map.entry("stuffed_potato", AssemblyRecipes.Base.FIRST), Map.entry("roast_chicken_block", AssemblyRecipes.Base.BOWL),
+                Map.entry("honey_glazed_ham_block", AssemblyRecipes.Base.BOWL), Map.entry("shepherds_pie_block", AssemblyRecipes.Base.BOWL),
+                Map.entry("rice_roll_medley_block", AssemblyRecipes.Base.BOWL),
+                Map.entry("gleaming_salad_block", AssemblyRecipes.Base.BOWL));
+        kinds.forEach((dish, base) -> helper.assertTrue(madeElsewhere(helper, dish) || made(dish).filter(it -> it.kind() == base).isPresent(),
+                dish + " goes down from its " + base));
+        Map<String, AssemblyRecipes.Finish> finishes = Map.ofEntries(
+                Map.entry("honey_glazed_ham_block", AssemblyRecipes.Finish.ARRANGE), Map.entry("bacon_and_eggs", AssemblyRecipes.Finish.ARRANGE),
+                Map.entry("steak_and_potatoes", AssemblyRecipes.Finish.ARRANGE), Map.entry("grilled_salmon", AssemblyRecipes.Finish.ARRANGE),
+                Map.entry("mixed_salad", AssemblyRecipes.Finish.TOSS), Map.entry("fruit_salad", AssemblyRecipes.Finish.TOSS),
+                Map.entry("nether_salad", AssemblyRecipes.Finish.TOSS), Map.entry("hamburger", AssemblyRecipes.Finish.SANDWICH),
+                Map.entry("egg_sandwich", AssemblyRecipes.Finish.SANDWICH), Map.entry("mutton_wrap", AssemblyRecipes.Finish.ROLL),
+                Map.entry("cod_roll", AssemblyRecipes.Finish.SHAPE), Map.entry("kelp_roll", AssemblyRecipes.Finish.ROLL),
+                Map.entry("barbecue_stick", AssemblyRecipes.Finish.SKEWER), Map.entry("melon_popsicle", AssemblyRecipes.Finish.FREEZE),
+                Map.entry("apple_pie", AssemblyRecipes.Finish.PRESS));
+        finishes.forEach((dish, finish) -> helper.assertTrue(madeElsewhere(helper, dish)
+                || made(dish).map(AssemblyRecipes.Assembly::finish).orElse(null) == finish, dish + " is finished by " + finish));
+        for (String crafted : List.of("cake_from_slices", "pumpkin_pie_from_slices", "pumpkin_from_slices", "milk_bucket_from_bottles",
+                "milk_bottle", "rice_panicle", "tomato_seeds")) {
+            helper.assertTrue(made(crafted).isEmpty(), crafted + " stays in the crafting table");
+        }
+        helper.assertTrue(tableMakes(helper, Map.of(0, new ItemStack(Items.WHEAT), 1, new ItemStack(Items.WATER_BUCKET))).isEmpty(),
+                "the table makes no dough from water either, though it is a recipe of its own type");
+        helper.succeed();
+    }
+
+    /** Dough from water: as many as there is wheat, and the bucket of water stays full, as in the crafting table. */
+    public static void doughKeepsItsWater(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.WHEAT, 5));
+        setup.place();
+        setup.carry(new ItemStack(Items.WATER_BUCKET));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(fd("wheat_dough")) && setup.onBoard().getCount() == 5, "five dough of five wheat");
+        helper.assertTrue(setup.cook.getInventory().countItem(Items.WATER_BUCKET) == 1, "and the water comes back");
+        helper.succeed();
+    }
+
+    /** A shaped recipe: the crust first, then all the rest in any order; the pie is a block and lies on the board. */
+    public static void aPieGoesIntoItsCrust(GameTestHelper helper) {
+        if (madeElsewhere(helper, "apple_pie")) {
+            helper.succeed();
+            return;
+        }
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("pie_crust"), 2));
+        setup.place();
+        for (Item layer : List.of(Items.APPLE, Items.SUGAR, Items.WHEAT, Items.APPLE, Items.WHEAT, Items.SUGAR, Items.APPLE, Items.WHEAT)) {
+            setup.carry(new ItemStack(layer, 2));
+            setup.place();
+        }
+        helper.assertTrue(setup.layers() == 0 && setup.onBoard().is(fd("apple_pie")) && setup.onBoard().getCount() == 2,
+                "two apple pies of nine layers");
+        helper.succeed();
+    }
+
+    /** Milk from a bucket: the bucket comes back, and a bucket goes down only one at a time, so one potato is stuffed. */
+    public static void milkGivesItsBucketBack(GameTestHelper helper) {
+        if (madeElsewhere(helper, "stuffed_potato")) {
+            helper.succeed();
+            return;
+        }
+        Board setup = board(helper);
+        // Cooked beef in Farmer's Delight's recipe; an addon may stuff it with something else (Delightful: a patty).
+        Item filling = made("stuffed_potato").flatMap(dish -> dish.ingredients().stream()
+                        .filter(in -> !in.test(new ItemStack(Items.BAKED_POTATO)) && !in.test(new ItemStack(Items.MILK_BUCKET))).findFirst())
+                .map(in -> in.getItems()[0].getItem()).orElse(Items.COOKED_BEEF);
+        setup.carry(new ItemStack(Items.BAKED_POTATO, 3));
+        setup.place();
+        setup.carry(new ItemStack(filling, 3));
+        setup.place();
+        setup.carry(new ItemStack(Items.MILK_BUCKET));
+        setup.place();
+        setup.finishIfItWaits();
+        helper.assertTrue(setup.onBoard().is(fd("stuffed_potato")) && setup.onBoard().getCount() == 1, "one stuffed potato");
+        Inventory inventory = setup.cook.getInventory();
+        helper.assertTrue(inventory.countItem(Items.BUCKET) == 1 && inventory.countItem(Items.MILK_BUCKET) == 0,
+                "the empty bucket comes back");
+        helper.assertTrue(inventory.countItem(Items.BAKED_POTATO) == 2 && inventory.countItem(filling) == 2, "and the rest");
+        helper.succeed();
+    }
+
+    /** Cookies come eight a round; the honey's bottles come back empty. */
+    public static void cookiesComeEightARound(GameTestHelper helper) {
+        Board setup = board(helper);
+        for (Item layer : List.of(Items.WHEAT, Items.HONEY_BOTTLE, Items.WHEAT)) {
+            setup.carry(new ItemStack(layer, 2));
+            setup.place();
+        }
+        setup.finishIfItWaits();
+        helper.assertTrue(setup.onBoard().is(fd("honey_cookie")) && setup.onBoard().getCount() == 16, "sixteen cookies of two rounds");
+        helper.assertTrue(setup.cook.getInventory().countItem(Items.GLASS_BOTTLE) == 2, "two empty bottles");
+        helper.succeed();
+    }
+
+    /** A feast takes nine things: the book lays them all from the inventory, and the feast lies on the board. */
+    public static void aFeastIsLaidFromTheBook(GameTestHelper helper) {
+        Board setup = board(helper);
+        Inventory inventory = setup.cook.getInventory();
+        inventory.setItem(0, new ItemStack(Items.SWEET_BERRIES, 4));
+        inventory.setItem(1, new ItemStack(Items.HONEY_BOTTLE));
+        inventory.setItem(2, new ItemStack(fd("smoked_ham")));
+        inventory.setItem(3, new ItemStack(fd("cooked_rice"), 2));
+        inventory.setItem(4, new ItemStack(Items.BOWL));
+        CompoundTag pick = new CompoundTag();
+        pick.putString(CuttingBoardStation.DISH, FarmersDelightContent.id("honey_glazed_ham_block").toString());
+        setup.act(CuttingBoardStation.ACTION_PICK, pick);
+        helper.assertTrue(setup.onBoard().is(fd("honey_glazed_ham_block")), "the ham feast lies on the board");
+        helper.assertTrue(inventory.countItem(Items.SWEET_BERRIES) == 0 && inventory.countItem(Items.GLASS_BOTTLE) == 1,
+                "everything was used; the honey's bottle came back");
+        helper.succeed();
+    }
+
+    /** The bowl goes down first, then what it holds; the thinnest layer says how many, the rest goes back. */
+    public static void aSaladStartsFromItsBowl(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.CRIMSON_FUNGUS, 5));
+        setup.place();
+        helper.assertTrue(setup.layers() == 0 && setup.onBoard().isEmpty(), "a fungus is no bowl");
+        setup.carry(new ItemStack(Items.BOWL, 3));
+        setup.place();
+        setup.carry(new ItemStack(Items.CRIMSON_FUNGUS, 5));
+        setup.place();
+        helper.assertTrue(setup.layers() == 2 && setup.cook.inventoryMenu.getCarried().getCount() == 2, "three fungi, as three bowls");
+        setup.carry(new ItemStack(Items.WARPED_FUNGUS, 2));
+        setup.place();
+        setup.finishIfItWaits();
+        helper.assertTrue(setup.layers() == 0, "the last one makes the salad");
+        helper.assertTrue(setup.onBoard().is(fd("nether_salad")) && setup.onBoard().getCount() == 2, "two, as there were two warped");
+        Inventory inventory = setup.cook.getInventory();
+        helper.assertTrue(inventory.countItem(Items.BOWL) == 1 && inventory.countItem(Items.CRIMSON_FUNGUS) == 1,
+                "a bowl and a fungus go back");
+        helper.succeed();
+    }
+
+    /** A dish picked in the book is laid from the inventory: a batch with shift, one set without; a dish made before is taken off. */
+    public static void theBookLaysADishFromTheInventory(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.cook.getInventory().setItem(5, new ItemStack(Items.BOWL, 20));
+        setup.cook.getInventory().setItem(6, new ItemStack(Items.CRIMSON_FUNGUS, 20));
+        setup.cook.getInventory().setItem(7, new ItemStack(Items.WARPED_FUNGUS, 20));
+        CompoundTag pick = new CompoundTag();
+        pick.putString(CuttingBoardStation.DISH, FarmersDelightContent.id("nether_salad").toString());
+        pick.putBoolean(CuttingBoardStation.ALL, true);
+        setup.act(CuttingBoardStation.ACTION_PICK, pick);
+        helper.assertTrue(setup.onBoard().is(fd("nether_salad")) && setup.onBoard().getCount() == CuttingBoardStation.BATCH,
+                "sixteen salads with shift");
+        Inventory inventory = setup.cook.getInventory();
+        helper.assertTrue(inventory.countItem(Items.BOWL) == 4 && inventory.countItem(Items.WARPED_FUNGUS) == 4,
+                "taken from the inventory");
+        pick.putBoolean(CuttingBoardStation.ALL, false);
+        setup.act(CuttingBoardStation.ACTION_PICK, pick);
+        helper.assertTrue(setup.onBoard().getCount() == 1 && inventory.countItem(fd("nether_salad")) == CuttingBoardStation.BATCH,
+                "one more without shift; the sixteen went to the cook");
+        setup.cook.getInventory().clearContent();
+        setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        setup.act(CuttingBoardStation.ACTION_PICK, pick);
+        helper.assertTrue(setup.layers() == 0 && setup.onBoard().isEmpty(), "nothing in the inventory, nothing on the board");
+        setup.carry(new ItemStack(Items.BOWL, 3));
+        setup.place();
+        setup.cook.getInventory().setItem(1, new ItemStack(Items.CRIMSON_FUNGUS, 5));
+        setup.cook.getInventory().setItem(2, new ItemStack(Items.WARPED_FUNGUS, 5));
+        setup.act(CuttingBoardStation.ACTION_PICK, pick);
+        helper.assertTrue(setup.onBoard().is(fd("nether_salad")) && setup.onBoard().getCount() == 3,
+                "onto three bowls the book lays the rest of three salads");
+        helper.succeed();
+    }
+
+    private static Item meal(String path) {
+        return BuiltInRegistries.ITEM.getValue(Identifier.fromNamespaceAndPath("modest_meals", path));
+    }
+
+    /** The board's dish {@code path} of Modest Meals' meals (its folder in this mod's ids). */
+    private static Optional<AssemblyRecipes.Assembly> mealDish(String path) {
+        Identifier id = HandsOnDelight.id("modest_meals/" + path);
+        return AssemblyRecipes.all().stream().filter(dish -> dish.id().equals(id)).findFirst();
+    }
+
+    /** Lays {@code layers} one by one, gives the word if the stack waits for it, and says what lies on the board. */
+    private static ItemStack lay(Board setup, List<ItemStack> layers) {
+        for (ItemStack layer : layers) {
+            setup.carry(layer.copy());
+            setup.place();
+        }
+        setup.finishIfItWaits();
+        return setup.onBoard();
+    }
+
+    /** What Modest Meals wrote into {@code stack}, as saved: the meal's contents. */
+    private static String saved(GameTestHelper helper, ItemStack stack) {
+        DynamicOps<JsonElement> ops = helper.getLevel().registryAccess().createSerializationContext(JsonOps.INSTANCE);
+        return ItemStack.CODEC.encodeStart(ops, stack).getOrThrow().toString();
+    }
+
+    /**
+     * With Modest Meals its meals of the crafting table are put together on the board: a player's crafting grid no longer makes them,
+     * the hamburger it makes of a patty, a leaf and a tomato has a page in the book and is pressed shut under its top bread, a
+     * sandwich of free fillings has no page.
+     */
+    public static void modestMealsComeToTheBoard(GameTestHelper helper) {
+        if (meal("sandwich") == Items.AIR) {
+            // Modest Meals comes with -Pmeals.
+            helper.succeed();
+            return;
+        }
+        AssemblyRecipes.Assembly hamburger = mealDish("farmersdelight/hamburger").orElse(null);
+        helper.assertTrue(hamburger != null && hamburger.inBook() && hamburger.result().is(fd("hamburger")),
+                "the hamburger is a dish of the board with its page");
+        helper.assertTrue(hamburger.kind() == AssemblyRecipes.Base.BREAD && hamburger.finish() == AssemblyRecipes.Finish.PRESS,
+                "laid on bread and pressed shut, got " + hamburger.kind() + " " + hamburger.finish());
+        helper.assertTrue(mealDish("sandwich/3").filter(dish -> !dish.inBook() && dish.result().is(meal("sandwich"))).isPresent(),
+                "a sandwich of any three fillings is one too, without a page");
+        helper.assertTrue(AssemblyRecipes.isMadeOnTheBoard(Identifier.fromNamespaceAndPath("modest_meals", "meal_crafting")),
+                "Modest Meals' recipe is made on the board");
+        Map<Integer, ItemStack> grid = Map.of(1, new ItemStack(Items.BREAD), 3, new ItemStack(fd("beef_patty")),
+                4, new ItemStack(fd("cabbage_leaf")), 5, new ItemStack(fd("tomato")), 7, new ItemStack(Items.BREAD));
+        helper.assertTrue(tableMakes(helper, grid).isEmpty(), "a player's crafting table makes no hamburger");
+        TransientCraftingContainer machine = new TransientCraftingContainer(new MachineMenu(), 3, 3);
+        grid.forEach(machine::setItem);
+        Level level = helper.getLevel();
+        helper.assertTrue(com.pockyl.handson_delight.compat.Recipes.manager(level).getRecipeFor(RecipeType.CRAFTING, machine.asCraftInput(), level).isPresent(),
+                "an autocrafter still does");
+        helper.succeed();
+    }
+
+    /** Modest Meals' hamburger is put together from the bread up and closed with bread: Farmer's Delight's hamburger, as its table made. */
+    public static void aModestHamburgerIsPutTogether(GameTestHelper helper) {
+        if (meal("sandwich") == Items.AIR) {
+            helper.succeed();
+            return;
+        }
+        Board setup = board(helper);
+        ItemStack made = lay(setup, List.of(new ItemStack(Items.BREAD), new ItemStack(fd("beef_patty")), new ItemStack(fd("cabbage_leaf")),
+                new ItemStack(fd("tomato")), new ItemStack(Items.BREAD)));
+        helper.assertTrue(made.is(fd("hamburger")), "a hamburger, got " + made + " and layers " + BoardLogic.layers(setup.station.state()));
+        helper.assertTrue(setup.layers() == 0, "both breads went into it");
+        helper.succeed();
+    }
+
+    /** Bread, any three fillings Modest Meals takes, bread: its sandwich of them. */
+    public static void aSandwichOfFreeFillings(GameTestHelper helper) {
+        if (meal("sandwich") == Items.AIR) {
+            helper.succeed();
+            return;
+        }
+        Board setup = board(helper);
+        ItemStack made = lay(setup, List.of(new ItemStack(Items.BREAD, 2), new ItemStack(Items.COOKED_BEEF, 2), new ItemStack(Items.CARROT, 2),
+                new ItemStack(Items.BAKED_POTATO, 2), new ItemStack(Items.BREAD, 2)));
+        helper.assertTrue(made.is(meal("sandwich")) && made.getCount() == 2,
+                "two sandwiches, got " + made + " and layers " + BoardLogic.layers(setup.station.state()));
+        helper.assertTrue(saved(helper, made).contains("cooked_beef"), "of beef, got " + saved(helper, made));
+        helper.succeed();
+    }
+
+    /** A pie of free fillings: the crust first, its sugar, three fruits. */
+    public static void aPieOfFreeFillingsGoesIntoItsCrust(GameTestHelper helper) {
+        if (meal("pie") == Items.AIR) {
+            helper.succeed();
+            return;
+        }
+        Board setup = board(helper);
+        ItemStack made = lay(setup, List.of(new ItemStack(fd("pie_crust")), new ItemStack(Items.SUGAR), new ItemStack(Items.SUGAR),
+                new ItemStack(Items.APPLE), new ItemStack(Items.SWEET_BERRIES), new ItemStack(Items.GLOW_BERRIES)));
+        helper.assertTrue(made.is(meal("pie")), "a pie, got " + made + " and layers " + BoardLogic.layers(setup.station.state()));
+        helper.succeed();
+    }
+
+    /** A salad takes up to three fillings: with two it waits for the cook's word, as any dish that could still grow. */
+    public static void aSaladOfTwoWaitsForAThird(GameTestHelper helper) {
+        if (meal("salad") == Items.AIR) {
+            helper.succeed();
+            return;
+        }
+        Board setup = board(helper);
+        for (ItemStack layer : List.of(new ItemStack(Items.BOWL), new ItemStack(fd("cabbage_leaf")), new ItemStack(Items.CARROT),
+                new ItemStack(Items.BEETROOT))) {
+            setup.carry(layer);
+            setup.place();
+        }
+        helper.assertTrue(setup.layers() == 4, "bowl, leaf, carrot and beetroot wait, got " + BoardLogic.layers(setup.station.state()));
+        setup.finishIfItWaits();
+        ItemStack made = setup.onBoard();
+        helper.assertTrue(made.is(meal("salad")), "a salad at the cook's word, got " + made);
+        helper.assertTrue(mealDish("salad/2").map(AssemblyRecipes.Assembly::finish).orElse(null) == AssemblyRecipes.Finish.TOSS,
+                "tossed in its bowl");
+        helper.succeed();
+    }
+
+    private static List<ItemStack> burger() {
+        return List.of(new ItemStack(Items.BREAD), new ItemStack(fd("beef_patty")), new ItemStack(fd("cabbage_leaf")),
+                new ItemStack(fd("tomato")), new ItemStack(fd("onion")));
+    }
+
+    /** A crafting grid that is no player's, as a machine has. */
+    private static final class MachineMenu extends AbstractContainerMenu {
+        MachineMenu() {
+            super(null, 0);
+        }
+
+        @Override
+        public ItemStack quickMoveStack(Player player, int index) {
+            return ItemStack.EMPTY;
+        }
+
+        @Override
+        public boolean stillValid(Player player) {
+            return true;
+        }
+    }
+
+    public static void aBurgerIsBuiltFromTheBreadUp(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("tomato"), 4));
+        setup.place();
+        helper.assertTrue(setup.layers() == 0 && setup.onBoard().isEmpty(), "a tomato is no base, and the board does not cut it");
+        helper.assertTrue(setup.cook.inventoryMenu.getCarried().getCount() == 4, "it stays in the hand");
+
+        setup.carry(new ItemStack(Items.BREAD, 3));
+        setup.place();
+        // Addons slice bread on the board: then it lies there to be cut until the patty goes on it.
+        boolean sliced = !Cutting.recipesFor(helper.getLevel(), new ItemStack(Items.BREAD)).isEmpty();
+        helper.assertTrue(sliced ? setup.onBoard().is(Items.BREAD) : setup.layers() == 1, "the bread goes down");
+        helper.assertTrue(setup.cook.inventoryMenu.getCarried().isEmpty(), "all three: a batch of three");
+        for (Item layer : List.of(fd("beef_patty"), fd("cabbage_leaf"), fd("tomato"))) {
+            setup.carry(new ItemStack(layer));
+            setup.place();
+        }
+        helper.assertTrue(setup.layers() == 4 && setup.onBoard().isEmpty(), "bread, patty, leaf and tomato");
+        setup.carry(new ItemStack(Items.CARROT));
+        setup.place();
+        helper.assertTrue(setup.layers() == 4, "a carrot belongs to no burger");
+        setup.act(CuttingBoardStation.ACTION_ASSEMBLE, new CompoundTag());
+        helper.assertTrue(setup.layers() == 4, "without the onion it is no burger yet");
+
+        boolean bigger = AssemblyRecipes.canGrow(List.of(new ItemStack(Items.BREAD), new ItemStack(fd("beef_patty")),
+                new ItemStack(fd("cabbage_leaf")), new ItemStack(fd("tomato")), new ItemStack(fd("onion"))));
+        setup.carry(new ItemStack(fd("onion")));
+        setup.place();
+        if (bigger) {
+            helper.assertTrue(setup.layers() == 5, "a bigger burger starts this way: the burger waits for the cook's word");
+            setup.finishIfItWaits();
+        }
+        helper.assertTrue(setup.layers() == 0, "the last layer makes the burger at once when nothing bigger starts this way");
+        helper.assertTrue(setup.onBoard().is(fd("hamburger")) && setup.onBoard().getCount() == 1, "one, as the patty was one");
+        helper.assertTrue(setup.cook.getInventory().countItem(Items.BREAD) == 2, "the bread not used goes back");
+        setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("hamburger")) == 1, "a click gives it to the cook");
+        helper.succeed();
+    }
+
+    public static void sixteenBurgersAtOnce(GameTestHelper helper) {
+        Board setup = board(helper);
+        for (Item layer : List.of(Items.BREAD, fd("beef_patty"), fd("cabbage_leaf"), fd("tomato"), fd("onion"))) {
+            setup.carry(new ItemStack(layer, 20));
+            setup.place();
+        }
+        setup.finishIfItWaits();
+        helper.assertTrue(setup.onBoard().is(fd("hamburger")) && setup.onBoard().getCount() == CuttingBoardStation.BATCH,
+                "sixteen burgers from stacks of twenty");
+        helper.assertTrue(setup.cook.inventoryMenu.getCarried().getCount() == 4, "the onions over sixteen stay in the hand");
+        helper.succeed();
+    }
+
+    public static void theTopLayerComesBack(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.BREAD));
+        setup.place();
+        setup.carry(new ItemStack(fd("tomato")));
+        setup.place();
+        setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        helper.assertTrue(setup.layers() == 1, "one layer off");
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("tomato")) == 1, "the top one, back to the cook");
+        helper.succeed();
+    }
+
+    /**
+     * Whatever the board cuts lies down to be cut, even when a dish starts from it (addons start many dishes from raw meat or
+     * vegetables): players found such food going onto a sandwich pile that the knife could not cut.
+     */
+    public static void everyCuttableFoodLiesDownToBeCut(GameTestHelper helper) {
+        Board setup = board(helper);
+        for (CuttingBoardRecipe recipe : Cutting.all(helper.getLevel())) {
+            ItemStack[] items = com.pockyl.handson_delight.compat.Recipes.ingredients(recipe).get(0).getItems();
+            if (items.length == 0) {
+                continue;
+            }
+            ItemStack food = items[0].copyWithCount(1);
+            setup.cook.getInventory().clearContent();
+            setup.carry(food.copy());
+            setup.place();
+            helper.assertTrue(setup.layers() == 0 && ItemStack.isSameItemSameComponents(setup.onBoard(), food),
+                    food.getItem() + " lies down to be cut");
+            setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+            helper.assertTrue(setup.onBoard().isEmpty(), food.getItem() + " comes back");
+        }
+        helper.succeed();
+    }
+
+    /** Food lying to be cut becomes the first layer of a dish when the dish's next layer goes on top of it. */
+    public static void cutFoodBecomesItsDishWhenTheNextLayerComes(GameTestHelper helper) {
+        for (AssemblyRecipes.Assembly dish : AssemblyRecipes.all()) {
+            for (ItemStack base : dish.ingredients().get(dish.base()).getItems()) {
+                if (Cutting.recipesFor(helper.getLevel(), base).isEmpty()) {
+                    continue;
+                }
+                for (int i = 0; i < dish.ingredients().size(); i++) {
+                    ItemStack[] next = dish.ingredients().get(i).getItems();
+                    // A next layer that cuts what lies there is its tool: it cuts.
+                    if (i == dish.base() || next.length == 0 || ItemStack.isSameItemSameComponents(next[0], base)
+                            || Cutting.findWith(helper.getLevel(), base, next[0]).isPresent()) {
+                        continue;
+                    }
+                    Board setup = board(helper);
+                    setup.carry(base.copyWithCount(3));
+                    setup.place();
+                    helper.assertTrue(setup.layers() == 0 && setup.onBoard().getCount() == 3, "it lies down to be cut first");
+                    setup.carry(next[0].copyWithCount(3));
+                    setup.place();
+                    helper.assertTrue(setup.onBoard().isEmpty() || !ItemStack.isSameItemSameComponents(setup.onBoard(), base),
+                            base.getItem() + " is no longer there to be cut once " + next[0].getItem() + " goes on it");
+                    helper.assertTrue(setup.layers() == 2 || setup.layers() == 0 && setup.onBoard().is(dish.result().getItem()),
+                            "they are the layers of " + dish.id() + ", or the dish already");
+                    helper.succeed();
+                    return;
+                }
+            }
+        }
+        // Farmer's Delight alone starts no dish from food the board cuts; addons (-Paddons) do.
+        helper.succeed();
+    }
+
+    /** A knife is never a layer of a dish: it knocks on the pile and stays in the hand. */
+    public static void aKnifeIsNoLayer(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.BOWL));
+        setup.place();
+        setup.carry(setup.knife.copy());
+        setup.place();
+        helper.assertTrue(setup.layers() == 1, "the bowl alone lies there");
+        helper.assertTrue(setup.cook.inventoryMenu.getCarried().is(setup.knife.getItem()), "the knife stays in the hand");
+        helper.succeed();
+    }
+
+    /**
+     * One item of each of {@code dish}'s ingredients, laid in the order a cook lays them: what goes down first, then the rest, the
+     * same item as the first one last (it would join the pile to be cut). Null when an ingredient lists nothing.
+     */
+    private static List<ItemStack> layersOf(AssemblyRecipes.Assembly dish) {
+        ItemStack[] first = dish.ingredients().get(dish.base()).getItems();
+        if (first.length == 0) {
+            return null;
+        }
+        List<ItemStack> order = new ArrayList<>(List.of(first[0].copyWithCount(1)));
+        List<ItemStack> same = new ArrayList<>();
+        for (int i = 0; i < dish.ingredients().size(); i++) {
+            ItemStack[] items = dish.ingredients().get(i).getItems();
+            if (items.length == 0) {
+                return null;
+            }
+            if (i != dish.base()) {
+                (ItemStack.isSameItemSameComponents(items[0], first[0]) ? same : order).add(items[0].copyWithCount(1));
+            }
+        }
+        order.addAll(same);
+        return order;
+    }
+
+    /**
+     * Every dish is laid by hand, layer after layer, even when an addon cuts something with one of its layers: Fright's Delight
+     * (-Paddons) cuts a mould with a glass bottle, and melon juice and every bottled drink could only be laid from the book.
+     */
+    public static void everyDishIsLaidByHand(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        Board setup = board(helper);
+        List<Identifier> failed = new ArrayList<>();
+        for (AssemblyRecipes.Assembly dish : AssemblyRecipes.all()) {
+            List<ItemStack> order = layersOf(dish);
+            // A second layer that cuts the first lying there cuts it: the dish starts from the book.
+            if (order == null || order.size() < 2 || Cutting.findWith(level, order.get(0), order.get(1)).isPresent()
+                    || Assembling.make(dish, order, level, 1).rounds() == 0) {
+                continue;
+            }
+            for (int i = 0; i < 2 * CuttingBoardStation.MOST_LAYERS && (setup.layers() > 0 || !setup.onBoard().isEmpty()); i++) {
+                setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+            }
+            setup.cook.getInventory().clearContent();
+            order.forEach(layer -> {
+                setup.carry(layer.copy());
+                setup.place();
+            });
+            setup.carry(ItemStack.EMPTY);
+            setup.finishIfItWaits();
+            // Another dish of the same layers may be made: then it lies there.
+            if (setup.layers() > 0 || !AssemblyRecipes.isDish(setup.onBoard().getItem())) {
+                failed.add(dish.id());
+            }
+        }
+        helper.assertTrue(failed.isEmpty(), "laid by hand: " + failed);
+        helper.succeed();
+    }
+
+    /**
+     * A thing some cut is made with that is also a layer of a dish (Fright's Delight's glass bottle, Immortaler's Delight's stick) is
+     * the tool over what it cuts, never laid on it; on a bare board it is laid when a dish starts from it.
+     */
+    public static void aToolThatIsALayerCutsOnlyWhatItCuts(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        for (CuttingBoardRecipe recipe : Cutting.all(level)) {
+            ItemStack[] inputs = com.pockyl.handson_delight.compat.Recipes.ingredients(recipe).get(0).getItems();
+            for (ItemStack tool : Cutting.tool(recipe).getItems()) {
+                if (inputs.length == 0 || !AssemblyRecipes.isBase(tool) || !Cutting.recipesFor(level, tool).isEmpty()) {
+                    continue;
+                }
+                Board setup = board(helper);
+                setup.carry(inputs[0].copyWithCount(1));
+                setup.place();
+                setup.carry(tool.copyWithCount(1));
+                setup.place();
+                helper.assertTrue(setup.layers() == 0 && ItemStack.isSameItemSameComponents(setup.onBoard(), inputs[0])
+                        && setup.cook.inventoryMenu.getCarried().is(tool.getItem()), tool.getItem() + " is the tool over " + inputs[0].getItem());
+                setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+                setup.carry(tool.copyWithCount(1));
+                setup.place();
+                helper.assertTrue(setup.layers() == 1 && setup.cook.inventoryMenu.getCarried().isEmpty(),
+                        tool.getItem() + " is laid on the bare board, as the first layer of a dish");
+                helper.succeed();
+                return;
+            }
+        }
+        // Farmer's Delight cuts with nothing a dish starts from; Fright's Delight (-Paddons) cuts a mould with a glass bottle.
+        helper.succeed();
+    }
+
+    /**
+     * The dish picked in the book is the one made, though another dish takes the same layers: Vintage Delight's and Delightful's
+     * peanut butter and jam sandwiches (-Paddons=wide), Ender's Delight's and Vanilla Delights' chorus pies are the same craft.
+     */
+    public static void aPickedDishWinsOverAnotherOfTheSameLayers(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        for (AssemblyRecipes.Assembly dish : AssemblyRecipes.all()) {
+            List<ItemStack> order = layersOf(dish);
+            if (order == null || Assembling.make(dish, order, level, 1).rounds() == 0) {
+                continue;
+            }
+            Optional<AssemblyRecipes.Assembly> first = Assembling.dishOf(order, level);
+            if (first.isEmpty() || first.get().result().is(dish.result().getItem())) {
+                continue;
+            }
+            Board setup = board(helper);
+            for (int slot = 0; slot < order.size(); slot++) {
+                setup.cook.getInventory().setItem(slot, order.get(slot).copy());
+            }
+            CompoundTag pick = new CompoundTag();
+            pick.putString(CuttingBoardStation.DISH, dish.id().toString());
+            setup.act(CuttingBoardStation.ACTION_PICK, pick);
+            helper.assertTrue(setup.layers() == 0 && setup.onBoard().is(dish.result().getItem()),
+                    dish.id() + " is made, not " + first.get().id() + " of the same layers");
+            helper.succeed();
+            return;
+        }
+        // Farmer's Delight alone has no two dishes of the same layers.
+        helper.succeed();
+    }
+
+    public static void aHamTakesTwoChopsAndFeedsTheCook(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("ham"), 2));
+        setup.place();
+        helper.assertTrue(setup.onBoard().getCount() == 2, "the whole stack lies on the board");
+        setup.chop(0);
+        helper.assertTrue(setup.onBoard().getCount() == 2, "one chop does not cut a ham");
+        helper.runAfterDelay(4, () -> {
+            setup.chop(0);
+            helper.assertTrue(setup.onBoard().getCount() == 2, "nor two on the same mark");
+        });
+        helper.runAfterDelay(8, () -> {
+            setup.chop(1);
+            helper.assertTrue(setup.onBoard().isEmpty(), "the second mark cuts both hams");
+            helper.assertTrue(setup.cook.getInventory().countItem(Items.PORKCHOP) == 4, "their pieces go to the cook");
+            helper.assertTrue(setup.cook.getInventory().countItem(Items.BONE) == 2, "all of them");
+            helper.assertTrue(helper.getLevel().getEntitiesOfClass(ItemEntity.class, new AABB(setup.station.pos()).inflate(3)).isEmpty(),
+                    "nothing falls on the floor");
+            helper.succeed();
+        });
+    }
+
+    /** Raw chicken falls into two cuts and its bone meal: two marks, and the last one cuts it (CurseForge, a player's report). */
+    public static void rawChickenFallsIntoItsCuts(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.CHICKEN, 2));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(Items.CHICKEN) && setup.onBoard().getCount() == 2, "the chicken lies there to be cut");
+        int marks = setup.logic.plan().marks();
+        helper.assertTrue(marks == 2, "two cuts and a bone: two marks, not " + marks);
+        setup.chop(0);
+        helper.runAfterDelay(4, () -> {
+            helper.assertTrue(setup.onBoard().getCount() == 2, "one mark does not cut it");
+            setup.chop(1);
+            helper.assertTrue(setup.onBoard().isEmpty(), "the last mark cuts both");
+            helper.assertTrue(setup.cook.getInventory().countItem(fd("chicken_cuts")) == 4, "their cuts go to the cook");
+            helper.assertTrue(setup.cook.getInventory().countItem(Items.BONE_MEAL) == 2, "with their bone meal");
+            helper.succeed();
+        });
+    }
+
+    /**
+     * An item two recipes cut is planned by the recipes' ids, never by a recipe manager's order: a 1.20.1 client keeps its recipes in
+     * hash maps of its own, in another order than its server, and drew two marks on raw chicken where the server waited for a third
+     * (PizzaCraft cuts it into four pieces as well; GitHub #26). Here the client is handed the second recipe first, as such a client
+     * would give it.
+     */
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    public static void aClientPlansTheMarksItsServerPlans(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        ItemStack chicken = new ItemStack(Items.CHICKEN);
+        CuttingBoardRecipe wings = new CuttingBoardRecipe("", Ingredient.of(Items.CHICKEN), Ingredient.of(fd("iron_knife")),
+                NonNullList.of(ChanceResult.EMPTY, new ChanceResult(new ItemStack(fd("chicken_cuts"), 2), 1.0F),
+                        new ChanceResult(new ItemStack(Items.FEATHER, 2), 1.0F), new ChanceResult(new ItemStack(Items.BONE_MEAL), 1.0F)),
+                Optional.empty());
+        List<RecipeHolder<?>> recipes = new ArrayList<>();
+        recipes.add(new RecipeHolder<>(HandsOnDelight.id("test_chicken_wings_5808"), wings));
+        recipes.addAll(com.pockyl.handson_delight.compat.Recipes.manager(level).getRecipes());
+        RecipeManager client = new RecipeManager(level.registryAccess());
+        client.replaceRecipes(recipes);
+        Optional<?> first = client.getAllRecipesFor((RecipeType) FarmersDelightContent.CUTTING.get()).stream()
+                .map(holder -> ((RecipeHolder<?>) holder).value())
+                .filter(recipe -> com.pockyl.handson_delight.compat.Recipes.ingredients(((CuttingBoardRecipe) recipe)).get(0).test(chicken)).findFirst();
+        helper.assertTrue(first.orElse(null) == wings, "the client's manager gives the four pieces first");
+        int marks = Cutting.plan(level, chicken).marks();
+        helper.assertTrue(marks == 2, "Farmer's Delight's own recipe plans the chicken on the server: two marks, not " + marks);
+        int clientMarks = Cutting.plan(client, level, chicken).marks();
+        helper.assertTrue(clientMarks == marks, "and on the client, by its id first: " + marks + " marks, not " + clientMarks);
+        helper.succeed();
+    }
+
+    public static void anEmptyHandCutsWithTheKnifeInTheInventory(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("cabbage"), 2));
+        setup.place();
+        setup.cook.getInventory().setItem(7, setup.knife.copy());
+        CompoundTag first = new CompoundTag();
+        first.putInt(CuttingBoardStation.MARK, 0);
+        first.putFloat(CuttingBoardStation.AT, 10.0F);
+        setup.act(CuttingBoardStation.ACTION_CHOP, first);
+        helper.runAfterDelay(4, () -> {
+            helper.assertTrue(setup.onBoard().isEmpty(), "one cut halves both cabbages");
+            helper.assertTrue(setup.cook.getInventory().countItem(fd("cabbage_leaf")) == 4, "the leaves go to the cook");
+            helper.assertTrue(setup.cook.getInventory().getItem(7).is(fd("iron_knife")), "the knife stays in its slot");
+            helper.assertTrue(setup.cook.inventoryMenu.getCarried().isEmpty(), "the hand stays empty");
+            helper.succeed();
+        });
+    }
+
+    public static void anEmptyHandWithoutAKnifeCutsNothing(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("cabbage"), 1));
+        setup.place();
+        CompoundTag first = new CompoundTag();
+        first.putInt(CuttingBoardStation.MARK, 0);
+        setup.act(CuttingBoardStation.ACTION_CHOP, first);
+        helper.runAfterDelay(4, () -> {
+            CompoundTag second = new CompoundTag();
+            second.putInt(CuttingBoardStation.MARK, 1);
+            setup.act(CuttingBoardStation.ACTION_CHOP, second);
+            helper.assertTrue(setup.onBoard().getCount() == 1, "no knife, no cut");
+            helper.succeed();
+        });
+    }
+
+    public static void sixteenAreCutAtOnce(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("cabbage"), 20));
+        setup.place();
+        setup.chop(0);
+        helper.assertTrue(setup.onBoard().getCount() == 20 - CuttingBoardStation.BATCH, "one cut goes through sixteen cabbages");
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("cabbage_leaf")) == 2 * CuttingBoardStation.BATCH, "two leaves each");
+        helper.runAfterDelay(4, () -> {
+            setup.chop(0);
+            helper.assertTrue(setup.onBoard().isEmpty(), "the next cut takes the rest");
+            helper.succeed();
+        });
+    }
+
+    public static void shiftClickLaysTheStackFromTheInventory(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.cook.getInventory().setItem(3, new ItemStack(fd("cabbage"), 5));
+        CompoundTag from = new CompoundTag();
+        from.putInt(CuttingBoardStation.FROM, 3);
+        setup.act(CuttingBoardStation.ACTION_PLACE, from);
+        helper.assertTrue(setup.onBoard().is(fd("cabbage")) && setup.onBoard().getCount() == 5, "the whole stack lies on the board");
+        helper.assertTrue(setup.cook.getInventory().getItem(3).isEmpty(), "and left its slot");
+        setup.cook.getInventory().setItem(4, new ItemStack(Items.BREAD, 2));
+        from.putInt(CuttingBoardStation.FROM, 4);
+        setup.act(CuttingBoardStation.ACTION_PLACE, from);
+        helper.assertTrue(setup.cook.getInventory().getItem(4).getCount() == 2, "bread does not go onto food being cut");
+        from.putInt(CuttingBoardStation.FROM, 99);
+        setup.act(CuttingBoardStation.ACTION_PLACE, from);
+        helper.succeed();
+    }
+
+    public static void marksAreCutInOrderAtNewPlaces(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("ham"), 2));
+        setup.place();
+        helper.assertTrue(setup.logic.plan().marks() == 2, "a ham falls into three pieces: two marks");
+        float[] first = setup.logic.spots();
+        helper.assertTrue(Math.abs(first[0] - first[1]) >= 0.15F, "the two marks lie apart");
+        for (int mark = 0; mark < 2; mark++) {
+            helper.assertTrue(first[mark] >= 0.2F && first[mark] <= 0.8F, "on the item, never at its ends");
+        }
+        float[] angles = setup.logic.angles();
+        for (int mark = 0; mark < 2; mark++) {
+            helper.assertTrue(Math.abs(angles[mark]) <= 1.0F, "a share of the most lean: never along the item");
+        }
+        helper.assertFalse(BoardLogic.crossOnTheItem(first[0], angles[0] * BoardLogic.MOST_LEAN, first[1], angles[1] * BoardLogic.MOST_LEAN),
+                "the two cuts never meet on the item");
+        helper.assertTrue(BoardLogic.crossOnTheItem(0.5F, 0.5F, 0.5F, -0.5F), "two marks through one point do");
+        helper.assertFalse(BoardLogic.crossOnTheItem(0.2F, 0.0F, 0.8F, 0.0F), "two straight across do not");
+        setup.chop(1);
+        helper.runAfterDelay(4, () -> {
+            setup.chop(0);
+            helper.assertTrue(setup.onBoard().getCount() == 2, "the second mark is not there before the first is cut");
+        });
+        helper.runAfterDelay(8, () -> {
+            setup.chop(1);
+            helper.assertTrue(setup.onBoard().isEmpty(), "then it cuts");
+            setup.carry(new ItemStack(fd("ham")));
+            setup.place();
+            float[] next = setup.logic.spots();
+            helper.assertFalse(next[0] == first[0] && next[1] == first[1], "the next item has marks of its own");
+            helper.succeed();
+        });
+    }
+
+    public static void layersStayOnTheBoard(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.BREAD));
+        setup.place();
+        setup.carry(new ItemStack(fd("beef_patty")));
+        setup.place();
+        Station again = new Station(helper.getLevel(), setup.station.pos());
+        new BoardLogic(again);
+        helper.assertTrue(BoardLogic.layers(again.state()).size() == 2, "the next cook finds the dish where it was");
+        CompoundTag saved = setup.board.saveWithoutMetadata(helper.getLevel().registryAccess());
+        CuttingBoardBlockEntity copy = (CuttingBoardBlockEntity) setup.board.getType().create(setup.station.pos(), setup.station.blockState());
+        copy.loadWithComponents(saved, helper.getLevel().registryAccess());
+        helper.assertTrue(((BoardLayers) copy).handson$layers().get(1).is(fd("beef_patty")), "it is saved with the board");
+        helper.succeed();
+    }
+
+    /**
+     * Every cut of Farmer's Delight goes through the station, cooking or not: a log is stripped there with an axe,
+     * leather armour cut into leather with shears. The book lists the kitchen's cuts first.
+     */
+    public static void everyCutIsTheStations(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        List<CuttingBoardRecipe> all = Cutting.all(level);
+        int log = indexOf(all, new ItemStack(Items.OAK_LOG));
+        int cabbage = indexOf(all, new ItemStack(fd("cabbage")));
+        helper.assertTrue(log >= 0 && indexOf(all, new ItemStack(Items.LEATHER_CHESTPLATE)) >= 0, "logs and leather armour are cut at the station");
+        helper.assertTrue(cabbage >= 0 && cabbage < log, "the kitchen's cuts come first in the book");
+        Board setup = board(helper);
+        BlockPos pos = setup.station.pos();
+        setup.cook.setItemInHand(InteractionHand.MAIN_HAND, new ItemStack(Items.OAK_LOG));
+        helper.assertTrue(CuttingBoardStation.opens(setup.cook, pos, helper.getLevel().getBlockState(pos)), "a log in the hand opens it");
+        setup.cook.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
+        setup.carry(new ItemStack(Items.OAK_LOG, 2));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(Items.OAK_LOG), "the station puts the logs down");
+        setup.carry(new ItemStack(Items.IRON_AXE));
+        int marks = setup.logic.plan().marks();
+        for (int mark = 0; mark < marks; mark++) {
+            int next = mark;
+            helper.runAfterDelay(1 + mark * 4L, () -> setup.chop(next));
+        }
+        helper.runAfterDelay(4L * marks + 2, () -> {
+            Inventory inventory = setup.cook.getInventory();
+            helper.assertTrue(inventory.countItem(Items.STRIPPED_OAK_LOG) == 2 && inventory.countItem(fd("tree_bark")) >= 2,
+                    "stripped with the axe, the bark for the cook");
+            setup.carry(new ItemStack(Items.LEATHER_CHESTPLATE));
+            setup.place();
+            helper.assertTrue(setup.onBoard().is(Items.LEATHER_CHESTPLATE), "leather armour lies down to be cut");
+            setup.carry(new ItemStack(Items.SHEARS));
+            int cuts = setup.logic.plan().marks();
+            for (int mark = 0; mark < cuts; mark++) {
+                int next = mark;
+                helper.runAfterDelay(1 + mark * 4L, () -> setup.chop(next));
+            }
+            helper.runAfterDelay(4L * cuts + 2, () -> {
+                helper.assertTrue(setup.onBoard().isEmpty() && setup.cook.getInventory().countItem(Items.LEATHER) >= 1, "cut into leather");
+                helper.succeed();
+            });
+        });
+    }
+
+    private static int indexOf(List<CuttingBoardRecipe> recipes, ItemStack input) {
+        for (int i = 0; i < recipes.size(); i++) {
+            if (com.pockyl.handson_delight.compat.Recipes.ingredients(recipes.get(i)).get(0).test(input)) {
+                return i;
+            }
+        }
+        return -1;
+    }
+
+    /**
+     * A knife cutting something into what the pot serves its meals on is cooking, cut at the station and listed in its book: Fright's
+     * Delight cuts a bone into the skewers of its kebabs. A basket taken apart or a bush cut with an axe is not.
+     */
+    public static void whatThePotServesOnIsCutAtTheStation(GameTestHelper helper) {
+        Ingredient flesh = Ingredient.of(Items.ROTTEN_FLESH);
+        CookingPotRecipe kebab = new CookingPotRecipe("", CookingPotRecipeBookTab.MEALS, NonNullList.of(Ingredient.of(java.util.stream.Stream.<net.minecraft.world.level.ItemLike>empty()), flesh, flesh), new ItemStack(Items.COOKED_MUTTON),
+                new ItemStack(Items.STICK), 1.0F, 100);
+        Ingredient knife = Ingredient.of(fd("iron_knife"));
+        CuttingBoardRecipe skewers = new CuttingBoardRecipe("", Ingredient.of(Items.BONE), knife,
+                NonNullList.of(ChanceResult.EMPTY, new ChanceResult(new ItemStack(Items.STICK, 2), 1.0F)), Optional.empty());
+        CuttingBoardRecipe basket = new CuttingBoardRecipe("", Ingredient.of(Items.BARREL), knife, NonNullList.of(ChanceResult.EMPTY,
+                new ChanceResult(new ItemStack(Items.LEATHER), 1.0F), new ChanceResult(new ItemStack(Items.STICK), 1.0F)), Optional.empty());
+        CuttingBoardRecipe bush = new CuttingBoardRecipe("", Ingredient.of(Items.DEAD_BUSH), Ingredient.of(Items.IRON_AXE),
+                NonNullList.of(ChanceResult.EMPTY, new ChanceResult(new ItemStack(Items.STICK, 2), 1.0F)), Optional.empty());
+        helper.assertTrue(Cutting.isCooking(skewers, List.of(kebab)), "a bone cut into the sticks a kebab is served on is cooking");
+        helper.assertFalse(Cutting.isCooking(skewers, List.of()), "without such a meal it is not");
+        helper.assertFalse(Cutting.isCooking(basket, List.of(kebab)), "a basket taken apart is not, though a stick comes off it");
+        helper.assertFalse(Cutting.isCooking(bush, List.of(kebab)), "nor a bush an axe cuts into sticks");
+
+        Level level = helper.getLevel();
+        Identifier shard = Identifier.tryParse("frightsdelight:bone_shard");
+        if (!BuiltInRegistries.ITEM.containsKey(shard)) {
+            // Fright's Delight comes with -Paddons.
+            helper.succeed();
+            return;
+        }
+        helper.assertTrue(Cutting.all(level).stream().anyMatch(recipe -> com.pockyl.handson_delight.compat.Recipes.ingredients(recipe).get(0).test(new ItemStack(Items.BONE))),
+                "and in its book");
+        Board setup = board(helper);
+        setup.carry(new ItemStack(Items.BONE, 3));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(Items.BONE) && setup.onBoard().getCount() == 3, "the bones lie down to be cut");
+        int marks = setup.logic.plan().marks();
+        for (int mark = 0; mark < marks; mark++) {
+            int next = mark;
+            helper.runAfterDelay(1 + mark * 4L, () -> setup.chop(next));
+        }
+        helper.runAfterDelay(4L * marks + 2, () -> {
+            helper.assertTrue(setup.onBoard().isEmpty(), "every mark cut, the bones are cut");
+            helper.assertTrue(setup.cook.getInventory().countItem(BuiltInRegistries.ITEM.getValue(shard)) >= 6, "into shards for the cook");
+            helper.succeed();
+        });
+    }
+
+    /**
+     * A tool stuck into the board opens the station like a bare board; sneaking keeps Farmer's Delight's own use. Food put down takes
+     * its place: the tool comes out into the inventory, from where it cuts that food.
+     */
+    public static void aToolStuckInTheBoardOpensTheStation(GameTestHelper helper) {
+        Board setup = board(helper);
+        BlockPos pos = setup.station.pos();
+        BlockState state = helper.getLevel().getBlockState(pos);
+        setup.board.carveToolOnBoard(new ItemStack(fd("iron_knife")));
+        helper.assertTrue(CuttingBoardStation.opens(setup.cook, pos, state), "a board with a knife stuck in opens");
+        setup.cook.setShiftKeyDown(true);
+        helper.assertFalse(CuttingBoardStation.opens(setup.cook, pos, state), "sneaking keeps Farmer's Delight's own use");
+        setup.cook.setShiftKeyDown(false);
+        setup.carry(new ItemStack(fd("cabbage"), 3));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(fd("cabbage")) && setup.onBoard().getCount() == 3 && !setup.board.isItemCarvingBoard(),
+                "the cabbages lie there to be cut, nothing stuck in");
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("iron_knife")) == 1, "the knife came out into the inventory");
+        helper.assertTrue(Cutting.toolSlot(helper.getLevel(), setup.onBoard(), setup.cook.getInventory()) >= 0, "and cuts from there");
+        helper.succeed();
+    }
+
+    /**
+     * A tool on the cursor is stuck into the bare board from the station, as Farmer's Delight's sneaking use sticks it in, and a click
+     * takes it out again into the inventory. Food is no tool, and nothing is stuck into food lying there.
+     */
+    public static void aToolIsStuckIntoTheBoardFromTheStation(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("cabbage")));
+        setup.act(CuttingBoardStation.ACTION_CARVE, new CompoundTag());
+        helper.assertTrue(setup.onBoard().isEmpty() && setup.cook.inventoryMenu.getCarried().is(fd("cabbage")), "food is no tool to stick in");
+        setup.carry(setup.knife.copy());
+        setup.act(CuttingBoardStation.ACTION_CARVE, new CompoundTag());
+        helper.assertTrue(setup.board.isItemCarvingBoard() && setup.onBoard().is(fd("iron_knife")), "the knife stands in the board");
+        helper.assertTrue(setup.cook.inventoryMenu.getCarried().isEmpty(), "and left the hand");
+        helper.assertTrue(setup.station.effects.contains(CuttingBoardStation.EFFECT_CARVED), "everybody hears it go in");
+        setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        helper.assertTrue(!setup.board.isItemCarvingBoard() && setup.onBoard().isEmpty(), "a click takes it out");
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("iron_knife")) == 1, "into the inventory");
+        setup.carry(new ItemStack(fd("cabbage")));
+        setup.place();
+        setup.carry(new ItemStack(Items.IRON_SWORD));
+        setup.act(CuttingBoardStation.ACTION_CARVE, new CompoundTag());
+        helper.assertTrue(!setup.board.isItemCarvingBoard() && setup.onBoard().is(fd("cabbage")), "nothing is stuck into food");
+        helper.assertTrue(setup.cook.inventoryMenu.getCarried().is(Items.IRON_SWORD), "the sword stays in the hand");
+        helper.succeed();
+    }
+
+    /**
+     * Food put down where something lies that is no work in hand, a dish made before or a block put there without the station, sends
+     * that to the cook and takes its place. Food waiting to be cut stays, and other food bounces back from it.
+     */
+    public static void foodMovesAFinishedDishAside(GameTestHelper helper) {
+        Board setup = board(helper);
+        Platform.INSTANCE.setItem(setup.board, new ItemStack(fd("hamburger"), 2));
+        setup.carry(new ItemStack(Items.BEEF, 3));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(Items.BEEF) && setup.onBoard().getCount() == 3, "the beef lies there to be cut");
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("hamburger")) == 2, "the burgers went to the cook");
+        setup.carry(new ItemStack(fd("cabbage")));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(Items.BEEF) && setup.cook.inventoryMenu.getCarried().is(fd("cabbage")),
+                "beef waiting to be cut stays, the cabbage stays in the hand");
+        helper.assertTrue(setup.station.effects.contains(CuttingBoardStation.EFFECT_REFUSED), "it bounced back");
+        Board other = board(helper, new BlockPos(3, 1, 1));
+        Platform.INSTANCE.setItem(other.board, new ItemStack(Items.COBBLESTONE));
+        other.carry(new ItemStack(fd("cabbage")));
+        other.place();
+        helper.assertTrue(other.onBoard().is(fd("cabbage")) && other.cook.getInventory().countItem(Items.COBBLESTONE) == 1,
+                "a block put there before goes to the cook too");
+        helper.succeed();
+    }
+
+    /**
+     * The stack in hand as the cook opens the board by its use goes down as a click would lay it; what the board cannot take stays in
+     * its slot without a word: no bounce, no sound.
+     */
+    public static void whatTheHandHeldStaysWhenTheBoardCannotTakeIt(GameTestHelper helper) {
+        Board setup = board(helper);
+        Inventory inventory = setup.cook.getInventory();
+        inventory.setItem(0, new ItemStack(Items.COBBLESTONE, 5));
+        setup.act(CuttingBoardStation.ACTION_PLACE, byUse(0));
+        helper.assertTrue(inventory.getItem(0).getCount() == 5 && setup.onBoard().isEmpty(), "a block stays in the hand");
+        inventory.setItem(1, new ItemStack(fd("cabbage"), 4));
+        setup.act(CuttingBoardStation.ACTION_PLACE, byUse(1));
+        helper.assertTrue(setup.onBoard().is(fd("cabbage")) && setup.onBoard().getCount() == 4 && inventory.getItem(1).isEmpty(),
+                "food goes down whole");
+        inventory.setItem(2, new ItemStack(Items.BEEF, 2));
+        setup.act(CuttingBoardStation.ACTION_PLACE, byUse(2));
+        helper.assertTrue(inventory.getItem(2).getCount() == 2 && setup.onBoard().is(fd("cabbage")), "other food stays in the hand");
+        helper.assertFalse(setup.station.effects.contains(CuttingBoardStation.EFFECT_REFUSED), "without a word");
+        helper.succeed();
+    }
+
+    private static CompoundTag byUse(int slot) {
+        CompoundTag data = new CompoundTag();
+        data.putInt(CuttingBoardStation.FROM, slot);
+        data.putBoolean(CuttingBoardStation.BY_USE, true);
+        return data;
+    }
+
+    /** A knife in the off hand is the one offered over the food when the main hand holds none: the first chop cuts with it. */
+    public static void aKnifeInTheOffHandCuts(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("cabbage"), 2));
+        setup.place();
+        Inventory inventory = setup.cook.getInventory();
+        inventory.setItem(Inventory.SLOT_OFFHAND, setup.knife.copy());
+        helper.assertTrue(Cutting.toolSlot(helper.getLevel(), setup.onBoard(), inventory) == Inventory.SLOT_OFFHAND,
+                "the off hand's knife is found");
+        CompoundTag first = new CompoundTag();
+        first.putInt(CuttingBoardStation.MARK, 0);
+        first.putFloat(CuttingBoardStation.AT, 10.0F);
+        setup.act(CuttingBoardStation.ACTION_CHOP, first);
+        helper.runAfterDelay(4, () -> {
+            helper.assertTrue(setup.onBoard().isEmpty() && inventory.countItem(fd("cabbage_leaf")) == 4, "one cut halves both cabbages");
+            helper.assertTrue(inventory.getItem(Inventory.SLOT_OFFHAND).is(fd("iron_knife")), "the knife stays in the off hand");
+            helper.succeed();
+        });
+    }
+
+    /** A carved knife the station takes off leaves the board bare, as Farmer's Delight's own take does: food laid next lies flat. */
+    public static void takingACarvedKnifeLeavesTheBoardBare(GameTestHelper helper) {
+        Board setup = board(helper);
+        BlockPos pos = setup.station.pos();
+        setup.board.carveToolOnBoard(new ItemStack(fd("iron_knife")));
+        setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        helper.assertTrue(setup.onBoard().isEmpty() && setup.cook.getInventory().countItem(fd("iron_knife")) == 1,
+                "the knife goes to the cook");
+        helper.assertFalse(setup.board.isItemCarvingBoard(), "nothing is carved into the board any more");
+        helper.assertTrue(CuttingBoardStation.opens(setup.cook, pos, helper.getLevel().getBlockState(pos)),
+                "the station opens on it again");
+        setup.carry(new ItemStack(fd("cabbage")));
+        setup.place();
+        helper.assertTrue(setup.onBoard().is(fd("cabbage")) && !setup.board.isItemCarvingBoard(), "a cabbage lies there to be cut");
+        helper.succeed();
+    }
+
+    /**
+     * Food lying to be cut stays as it lies when a dish picked in the book starts from it but the inventory lacks the rest: it could
+     * no longer be cut as a layer. With the rest there it becomes the dish's first layer.
+     */
+    public static void aBookPickLeavesTheFoodUntilTheRestIsThere(GameTestHelper helper) {
+        for (AssemblyRecipes.Assembly dish : AssemblyRecipes.all()) {
+            List<ItemStack> rest = new ArrayList<>();
+            for (int i = 0; i < dish.ingredients().size(); i++) {
+                ItemStack[] items = dish.ingredients().get(i).getItems();
+                if (i != dish.base() && items.length > 0) {
+                    rest.add(items[0].copyWithCount(1));
+                }
+            }
+            if (rest.size() != dish.ingredients().size() - 1) {
+                continue;
+            }
+            for (ItemStack base : dish.ingredients().get(dish.base()).getItems()) {
+                if (Cutting.recipesFor(helper.getLevel(), base).isEmpty()) {
+                    continue;
+                }
+                Board setup = board(helper);
+                setup.carry(base.copyWithCount(3));
+                setup.place();
+                CompoundTag pick = new CompoundTag();
+                pick.putString(CuttingBoardStation.DISH, dish.id().toString());
+                setup.act(CuttingBoardStation.ACTION_PICK, pick);
+                boolean stays = setup.layers() == 0 && ItemStack.isSameItemSameComponents(setup.onBoard(), base)
+                        && setup.onBoard().getCount() == 3;
+                helper.assertTrue(stays, base.getItem() + " stays to be cut: the inventory has nothing else of " + dish.id());
+                rest.forEach(item -> setup.cook.getInventory().add(item.copy()));
+                setup.act(CuttingBoardStation.ACTION_PICK, pick);
+                helper.assertFalse(setup.layers() == 0 && ItemStack.isSameItemSameComponents(setup.onBoard(), base),
+                        base.getItem() + " goes into " + dish.id() + " once the rest is there");
+                helper.succeed();
+                return;
+            }
+        }
+        // Farmer's Delight alone starts no dish from food the board cuts; addons (-Paddons) do.
+        helper.succeed();
+    }
+
+    /**
+     * A dish is shown ready only when its own recipe takes the layers: the game's shapeless recipes on Fabric pass over a renamed
+     * item, which the dish's ingredients take. A stack its recipe refuses is not ready, and a click takes its top layer back
+     * instead of trying in vain for good.
+     */
+    public static void aStackItsRecipeRefusesComesBackOff(GameTestHelper helper) {
+        Board setup = board(helper);
+        ItemStack prize = new ItemStack(fd("tomato"));
+        prize.set(DataComponents.CUSTOM_NAME, Component.literal("Prize tomato"));
+        for (ItemStack layer : List.of(new ItemStack(Items.BREAD), new ItemStack(fd("beef_patty")), new ItemStack(fd("cabbage_leaf")),
+                prize, new ItemStack(fd("onion")))) {
+            setup.carry(layer);
+            setup.place();
+        }
+        List<ItemStack> layers = List.copyOf(BoardLogic.layers(setup.station.state()));
+        if (layers.isEmpty()) {
+            helper.assertTrue(setup.onBoard().is(fd("hamburger")), "the recipe took the renamed tomato: the burger is made");
+            helper.succeed();
+            return;
+        }
+        boolean makes = Assembling.dishOf(layers, helper.getLevel()).isPresent();
+        boolean shown = !setup.station.state().data().getStringOr(CuttingBoardStation.DISH, "").isEmpty();
+        helper.assertTrue(makes == shown, "a dish is shown ready exactly when its recipe makes it");
+        // What the cook's click sends: the dish when one is ready, else the top layer back.
+        setup.act(shown ? CuttingBoardStation.ACTION_ASSEMBLE : CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        helper.assertTrue(shown ? setup.layers() == 0 : setup.layers() == layers.size() - 1, "the click does what the cook sees");
+        helper.succeed();
+    }
+
+    /** A chop the board does not take is answered, so the cook's client can close the cut it drew at once. */
+    public static void anIgnoredChopIsAnswered(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("ham"), 2));
+        setup.place();
+        setup.station.effects.clear();
+        setup.chop(1);
+        helper.assertTrue(setup.station.effects.contains(CuttingBoardStation.EFFECT_REFUSED), "the second mark before the first: refused");
+        setup.station.effects.clear();
+        setup.chop(0);
+        setup.chop(1);
+        helper.assertTrue(setup.station.effects.contains(CuttingBoardStation.EFFECT_REFUSED), "two chops in one tick: the second refused");
+        helper.assertTrue(setup.onBoard().getCount() == 2, "and nothing was cut");
+        helper.succeed();
+    }
+
+    /** One cook leaving does not take the marks from another one still cutting; the last one leaving does. */
+    public static void anotherCookKeepsTheMarks(GameTestHelper helper) {
+        Board setup = board(helper);
+        Player other = helper.makeMockPlayer(GameType.CREATIVE);
+        setup.station.users.add(other);
+        setup.carry(new ItemStack(fd("ham"), 2));
+        setup.place();
+        setup.chop(0);
+        setup.logic.onClose(setup.station, setup.cook);
+        helper.assertTrue(setup.station.state().data().getIntOr(CuttingBoardStation.MARKS, 0) == 1, "the first mark stays cut for the other cook");
+        setup.station.users.clear();
+        setup.logic.onClose(setup.station, other);
+        helper.assertTrue(setup.station.state().data().getIntOr(CuttingBoardStation.MARKS, 0) == 0, "and starts over when the board is left");
+        helper.succeed();
+    }
+
+    public static void noKnifeNoCut(GameTestHelper helper) {
+        Board setup = board(helper);
+        setup.cook.getInventory().setItem(5, new ItemStack(fd("iron_knife")));
+        setup.carry(new ItemStack(fd("cabbage")));
+        setup.place();
+        setup.carry(new ItemStack(Items.STICK));
+        setup.chop(0);
+        setup.carry(ItemStack.EMPTY);
+        helper.assertTrue(setup.onBoard().is(fd("cabbage")), "a knife in the inventory does not cut: it must be in the hand");
+        setup.act(CuttingBoardStation.ACTION_TAKE, new CompoundTag());
+        helper.assertTrue(setup.onBoard().isEmpty(), "and can be taken back");
+        helper.assertTrue(setup.cook.getInventory().countItem(fd("cabbage")) == 1, "into the inventory");
+        helper.succeed();
+    }
+
+    /** As many marks as the pieces ask, laid as the food is cut: slices of a roll even, a pie in wedges, pasta in strips. */
+    public static void marksFollowWhatTheFoodFallsInto(GameTestHelper helper) {
+        Level level = helper.getLevel();
+        helper.assertTrue(Cutting.plan(level, new ItemStack(Items.BEEF)).marks() == 1, "beef into two: one cut");
+        helper.assertTrue(Cutting.plan(level, new ItemStack(Items.COD)).marks() == 2, "a cod into two slices and its bones: two");
+        Cutting.Plan roll = Cutting.plan(level, new ItemStack(fd("kelp_roll")));
+        helper.assertTrue(roll.marks() == 2 && roll.style() == Cutting.Style.STRAIGHT, "a kelp roll into three even slices");
+        Cutting.Plan pie = Cutting.plan(level, new ItemStack(fd("apple_pie")));
+        helper.assertTrue(pie.marks() == 2 && pie.style() == Cutting.Style.WEDGES, "a pie into four wedges: two cuts through its middle");
+        helper.assertTrue(Cutting.plan(level, new ItemStack(Items.CAKE)).marks() == Cutting.MOST_MARKS, "a cake into seven: three cuts at most");
+        helper.assertTrue(Cutting.plan(level, new ItemStack(fd("wheat_dough"))).style() == Cutting.Style.STRIPS, "dough into strips");
+        Board setup = board(helper);
+        setup.carry(new ItemStack(fd("kelp_roll")));
+        setup.place();
+        float[] spots = setup.logic.spots();
+        float[] angles = setup.logic.angles();
+        helper.assertTrue(Math.abs(spots[0] - 1.0F / 3.0F) < 1.0e-4F && Math.abs(spots[1] - 2.0F / 3.0F) < 1.0e-4F, "even slices");
+        helper.assertTrue(angles[0] == 0.0F && angles[1] == 0.0F, "square across");
+        setup.chop(0);
+        helper.runAfterDelay(4, () -> {
+            setup.chop(1);
+            helper.assertTrue(setup.cook.getInventory().countItem(fd("kelp_roll_slice")) == 3, "the second cut makes the slices");
+            helper.succeed();
+        });
+    }
+
+    /** The board's station as the library would hold it, without a player at it. */
+    private static final class Station implements StationContext {
+        private final Level level;
+        private final BlockPos pos;
+        private final StationState state = new StationState(CuttingBoardStation.SCHEMA);
+        private final List<Player> users = new ArrayList<>();
+        private final List<Identifier> effects = new ArrayList<>();
+
+        Station(Level level, BlockPos pos) {
+            this.level = level;
+            this.pos = pos;
+        }
+
+        @Override
+        public StationType type() {
+            return CuttingBoardStation.TYPE;
+        }
+
+        @Override
+        public Level level() {
+            return level;
+        }
+
+        @Override
+        public BlockPos pos() {
+            return pos;
+        }
+
+        @Override
+        public BlockState blockState() {
+            return level.getBlockState(pos);
+        }
+
+        @Override
+        public Direction facing() {
+            return Direction.NORTH;
+        }
+
+        @Override
+        public StationState state() {
+            return state;
+        }
+
+        @Override
+        public Collection<? extends Player> users() {
+            return users;
+        }
+
+        @Override
+        public void effect(Identifier effect, String node, CompoundTag data) {
+            effects.add(effect);
+        }
+    }
+
+    /**
+     * Barbeque's Delight's kebab wrap, kebab sandwich and bibimbap are crafts of its own type that put the grilled skewers, seasoning
+     * and all, into the dish: made on the board they keep doing it, as the recipe's own code makes the dish. With -Paddons=wide.
+     */
+    public static void kebabsKeepTheSeasoningOfTheirSkewers(GameTestHelper helper) {
+        Item wrap = BuiltInRegistries.ITEM.getValue(Identifier.parse("barbequesdelight:kebab_wrap"));
+        Item grilled = BuiltInRegistries.ITEM.getValue(Identifier.parse("barbequesdelight:grilled_beef_skewer"));
+        DataComponentType<?> seasoning = BuiltInRegistries.DATA_COMPONENT_TYPE.get(Identifier.parse("barbequesdelight:seasoning"));
+        if (wrap == Items.AIR || grilled == Items.AIR || seasoning == null) {
+            // Barbeque's Delight comes with -Paddons=wide.
+            helper.succeed();
+            return;
+        }
+        for (String dish : List.of("kebab_wrap", "kebab_sandwich", "bibimbap")) {
+            Identifier id = Identifier.parse("barbequesdelight:" + dish);
+            helper.assertTrue(AssemblyRecipes.all().stream().anyMatch(made -> made.id().equals(id)), dish + " is a dish of the board");
+        }
+        DynamicOps<JsonElement> ops = helper.getLevel().registryAccess().createSerializationContext(JsonOps.INSTANCE);
+        ItemStack skewer = new ItemStack(grilled);
+        helper.assertTrue(season(skewer, seasoning, ops, "CHILI") || season(skewer, seasoning, ops, "chili"), "the skewer takes chili");
+        Board setup = board(helper);
+        for (ItemStack layer : List.of(new ItemStack(Items.BREAD), skewer, new ItemStack(fd("cabbage")))) {
+            setup.carry(layer.copy());
+            setup.place();
+        }
+        setup.finishIfItWaits();
+        ItemStack made = setup.onBoard();
+        helper.assertTrue(made.is(wrap), "a kebab wrap, got " + made + " and layers " + BoardLogic.layers(setup.station.state()));
+        String saved = ItemStack.CODEC.encodeStart(ops, made).getOrThrow().toString();
+        helper.assertTrue(saved.contains("grilled_beef_skewer") && saved.toLowerCase(Locale.ROOT).contains("chili"),
+                "with its skewer's chili, got " + saved);
+        helper.succeed();
+    }
+
+    /** Gives {@code stack} the component {@code type} as {@code name} reads; false where it does not read so. */
+    private static <T> boolean season(ItemStack stack, DataComponentType<T> type, DynamicOps<JsonElement> ops, String name) {
+        Optional<T> value;
+        try {
+            value = type.codecOrThrow().parse(ops, new JsonPrimitive(name)).result();
+        } catch (RuntimeException unknown) {
+            // Barbeque's Delight's enum codec throws for a name it does not know.
+            return false;
+        }
+        value.ifPresent(read -> stack.set(type, read));
+        return value.isPresent();
+    }
+
+    /**
+     * Chopper's Delight's boards of every wood and its decorated board (-Paddons) are the board's station: what lies there is cut the
+     * same way, and a dish being put together is kept in the board. The decorated board's renderer draws the board itself.
+     */
+    public static void choppersDelightsBoardsAreStations(GameTestHelper helper) {
+        Block oak = BuiltInRegistries.BLOCK.getValue(Identifier.tryParse("choppersdelight:oak_cutting_board"));
+        if (oak == Blocks.AIR) {
+            // Chopper's Delight comes with -Paddons.
+            helper.succeed();
+            return;
+        }
+        Block decorated = BuiltInRegistries.BLOCK.getValue(Identifier.tryParse("choppersdelight:decorated_cutting_board"));
+        helper.assertTrue(CuttingBoardStation.TYPE.matches(oak.defaultBlockState()), "the oak board opens as the station");
+        helper.assertTrue(CuttingBoardStation.TYPE.matches(decorated.defaultBlockState()), "the decorated board opens as the station");
+        ChoppersCut oakCut = cutAtChoppersBoard(helper, oak, new BlockPos(1, 1, 1));
+        ChoppersCut decoratedCut = cutAtChoppersBoard(helper, decorated, new BlockPos(3, 1, 1));
+        helper.assertFalse(oakCut.board().handson$rendersBoard(), "the oak board's block draws it");
+        helper.assertTrue(decoratedCut.board().handson$rendersBoard(), "the decorated board's renderer draws it");
+        helper.runAfterDelay(4, () -> {
+            for (ChoppersCut cut : List.of(oakCut, decoratedCut)) {
+                KitchenBoard board = cut.board();
+                helper.assertTrue(board.handson$stored().isEmpty() && cut.cook().getInventory().countItem(fd("cabbage_leaf")) == 4,
+                        "one cut halves both, the leaves go to the cook");
+                board.handson$layers().set(0, new ItemStack(Items.BREAD));
+                CompoundTag saved = board.handson$blockEntity().saveWithoutMetadata(helper.getLevel().registryAccess());
+                helper.assertTrue(saved.contains(HandsOnDelight.MOD_ID + ":layers"), "a dish being put together is saved with the board");
+                board.handson$layers().clear();
+            }
+            helper.succeed();
+        });
+    }
+
+    private record ChoppersCut(KitchenBoard board, Player cook) {
+    }
+
+    /** Lays two cabbages on a board of {@code block} at {@code at} and cuts them once with a knife from the cook's inventory. */
+    private static ChoppersCut cutAtChoppersBoard(GameTestHelper helper, Block block, BlockPos at) {
+        helper.setBlock(at, block);
+        Station station = new Station(helper.getLevel(), helper.absolutePos(at));
+        BoardLogic logic = new BoardLogic(station);
+        KitchenBoard board = KitchenBoard.of(helper.getLevel().getBlockEntity(station.pos()));
+        helper.assertTrue(board != null, "its block entity is a kitchen board");
+        // Refabricated's board casts the cutting player to a server player.
+        ServerPlayer cook = TestPlayers.serverPlayer(helper, "cook");
+        cook.inventoryMenu.setCarried(new ItemStack(fd("cabbage"), 2));
+        logic.onCustomAction(station, cook, CuttingBoardStation.ACTION_PLACE, new CompoundTag());
+        helper.assertTrue(board.handson$stored().is(fd("cabbage")) && board.handson$stored().getCount() == 2, "both cabbages lie there");
+        cook.getInventory().setItem(7, new ItemStack(fd("iron_knife")));
+        CompoundTag chop = new CompoundTag();
+        chop.putInt(CuttingBoardStation.MARK, 0);
+        chop.putFloat(CuttingBoardStation.AT, 10.0F);
+        logic.onCustomAction(station, cook, CuttingBoardStation.ACTION_CHOP, chop);
+        return new ChoppersCut(board, cook);
+    }
+}
