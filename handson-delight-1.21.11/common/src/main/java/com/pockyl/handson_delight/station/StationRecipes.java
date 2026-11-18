@@ -63,7 +63,8 @@ public final class StationRecipes {
             return;
         }
         for (ItemStack kind : kinds) {
-            if (ItemStack.isSameItemSameComponents(kind, stack)) {
+            if (com.pockyl.handson_delight.compat.FoodFreshness.sameFood(kind, stack)) {
+                com.pockyl.handson_delight.compat.FoodFreshness.olderInto(kind, stack);
                 kind.grow(stack.getCount());
                 return;
             }
@@ -307,7 +308,7 @@ public final class StationRecipes {
         for (int slot = 0; slot < size; slot++) {
             ItemStack there = slots.get(slot);
             for (int kind = 0; kind < kinds.size() && !there.isEmpty(); kind++) {
-                if (placed[kind] < parts[kind] && ItemStack.isSameItemSameComponents(there, kinds.get(kind))) {
+                if (placed[kind] < parts[kind] && com.pockyl.handson_delight.compat.FoodFreshness.sameFood(there, kinds.get(kind))) {
                     kindAt[slot] = kind;
                     placed[kind]++;
                     break;
@@ -420,7 +421,7 @@ public final class StationRecipes {
             if (stack.getCount() < wanted) {
                 continue;
             }
-            if (held.stream().anyMatch(kind -> ItemStack.isSameItemSameComponents(kind, stack))) {
+            if (held.stream().anyMatch(kind -> com.pockyl.handson_delight.compat.FoodFreshness.sameFood(kind, stack))) {
                 return slot;
             }
             if (any < 0) {

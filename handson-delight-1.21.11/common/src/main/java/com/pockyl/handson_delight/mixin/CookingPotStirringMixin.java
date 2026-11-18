@@ -18,6 +18,7 @@ import org.spongepowered.asm.mixin.Shadow;
 import org.spongepowered.asm.mixin.Unique;
 import org.spongepowered.asm.mixin.injection.At;
 import org.spongepowered.asm.mixin.injection.Inject;
+import org.spongepowered.asm.mixin.injection.Redirect;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfo;
 import org.spongepowered.asm.mixin.injection.callback.CallbackInfoReturnable;
 import vectorwing.farmersdelight.common.block.entity.CookingPotBlockEntity;
@@ -35,6 +36,36 @@ import com.pockyl.handson_delight.station.PotCooking;
  */
 @Mixin(value = CookingPotBlockEntity.class, remap = false)
 abstract class CookingPotStirringMixin implements KitchenPot {
+    @Unique
+    private java.util.List<ItemStack> handson$ageInputs = java.util.List.of();
+
+    @Redirect(method = "canCook", remap = false, at = @At(value = "INVOKE", remap = true,
+            target = "Lnet/minecraft/world/item/ItemStack;isSameItemSameComponents(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/ItemStack;)Z"))
+    private boolean handson$compareAgedMeal(ItemStack meal, ItemStack result) {
+        return com.pockyl.handson_delight.compat.FoodFreshness.sameFood(meal, result);
+    }
+
+    @Redirect(method = "processCooking", remap = false, at = @At(value = "INVOKE", remap = true,
+            target = "Lnet/minecraft/world/item/ItemStack;isSameItemSameComponents(Lnet/minecraft/world/item/ItemStack;Lnet/minecraft/world/item/ItemStack;)Z"))
+    private boolean handson$mergeAgedMeal(ItemStack meal, ItemStack result) {
+        return com.pockyl.handson_delight.compat.FoodFreshness.sameFood(meal, result);
+    }
+
+    @Inject(method = "processCooking", at = @At("HEAD"))
+    private void handson$rememberIngredientAges(RecipeHolder<CookingPotRecipe> recipe, CookingPotBlockEntity pot,
+            CallbackInfoReturnable<Boolean> callback) {
+        handson$ageInputs = KitchenPot.ingredients(this).stream().map(ItemStack::copy).toList();
+    }
+
+    @Inject(method = "processCooking", at = @At("RETURN"))
+    private void handson$keepIngredientAges(RecipeHolder<CookingPotRecipe> recipe, CookingPotBlockEntity pot,
+            CallbackInfoReturnable<Boolean> callback) {
+        if (callback.getReturnValueZ() && pot.getLevel() != null) {
+            ItemStack aged = com.pockyl.handson_delight.compat.FoodFreshness.prepared(recipe.value().result(), pot.getLevel(), handson$ageInputs);
+            com.pockyl.handson_delight.compat.FoodFreshness.olderInto(pot.getMeal(), aged);
+        }
+        handson$ageInputs = java.util.List.of();
+    }
     @Shadow
     private int cookTime;
     @Shadow

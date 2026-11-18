@@ -258,9 +258,10 @@ public final class PotCooking {
         ItemStack result = made;
         made = ItemStack.EMPTY;
         ItemStack meal = pot.handson$meal();
-        if (result.isEmpty() || !ItemStack.isSameItemSameComponents(meal, result) || meal.getCount() <= mealBefore) {
+        if (result.isEmpty() || !com.pockyl.handson_delight.compat.FoodFreshness.sameFood(meal, result) || meal.getCount() <= mealBefore) {
             return;
         }
+        com.pockyl.handson_delight.compat.FoodFreshness.olderInto(meal, result);
         serveTheBatch(recipe, result, meal);
     }
 
@@ -268,8 +269,8 @@ public final class PotCooking {
     private void serveTheBatch(RecipeHolder<CookingPotRecipe> recipe, ItemStack result, ItemStack meal) {
         // The batch as the step before counted it, before the pot's serving: a slot that held the last item is empty now, and a count
         // made now would leave it out and cook the rest without it.
-        // The pot lets the meal grow past its stack size: the serving it made is then the only one.
-        int room = Math.max(1, (result.getMaxStackSize() - meal.getCount()) / result.getCount() + 1);
+        // The pot stores soup in bulk, independently of the plated item's carried stack limit.
+        int room = Math.max(1, PotLogic.batchRoom(result, meal.getCount()) + 1);
         int left = Math.min(room, batch);
         grade = skill.grade(level().getGameTime());
         // The most servings the room takes, out of as few ingredients as that needs: what is saved stays in the pot.

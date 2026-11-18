@@ -411,10 +411,18 @@ public final class PotLogic implements StationLogic {
     /** {@link #batch(KitchenPot, CookingPotRecipe)} with {@code result}, what the recipe cooks of what lies in the pot. */
     public static int batch(KitchenPot pot, CookingPotRecipe recipe, ItemStack result) {
         ItemStack meal = pot.handson$meal();
-        if (result.isEmpty() || !meal.isEmpty() && !ItemStack.isSameItemSameComponents(meal, result)) {
+        if (result.isEmpty() || !meal.isEmpty() && !com.pockyl.handson_delight.compat.FoodFreshness.sameFood(meal, result)) {
             return 0;
         }
-        return Math.max(0, Math.min(servingsLeft(pot, recipe), (result.getMaxStackSize() - meal.getCount()) / result.getCount()));
+        return Math.max(0, Math.min(servingsLeft(pot, recipe), batchRoom(result, meal.getCount())));
+    }
+
+    /** Internal soup capacity is independent of the plated item's inventory stack limit. */
+    public static int batchRoom(ItemStack result, int alreadyCooked) {
+        if (result.isEmpty() || result.getCount() <= 0) {
+            return 0;
+        }
+        return Math.max(0, (Math.max(64, result.getMaxStackSize()) - alreadyCooked) / result.getCount());
     }
 
     /** How many times as fast as one serving a batch cooks: sixteen servings take four times as long as one, so a full pot is still work. */

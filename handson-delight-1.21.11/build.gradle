@@ -2,7 +2,7 @@ plugins {
     id 'fabric-loom' version '1.17.19'
     id 'maven-publish'
 }
-version = '1.5.0-port.1'
+version = '1.5.0-port.2'
 group = 'com.pockyl.handson_delight'
 base { archivesName = 'handson-delight-fabric-1.21.11' }
 repositories {
@@ -19,6 +19,7 @@ dependencies {
     modImplementation 'net.fabricmc:fabric-loader:0.20.1'
     modImplementation 'net.fabricmc.fabric-api:fabric-api:0.141.6+1.21.11'
     modImplementation 'maven.modrinth:farmers-delight-refabricated:1.21.11-3.6.16'
+    modCompileOnly 'maven.modrinth:spoiled:OcBmt9fg'
     compileOnly files(providers.gradleProperty('diegesisDevJar').getOrElse('../diegesis-1.21.11/build/devlibs/diegesis-fabric-1.21.11-1.0.0-beta.11-port.1-dev.jar'))
     compileOnly 'org.ow2.asm:asm-tree:9.7.1'
     compileOnly('dev.architectury:architectury-fabric:19.0.1') { transitive = false }
@@ -54,6 +55,6 @@ dependencies {
     testImplementation platform('org.junit:junit-bom:5.12.2')
     testImplementation 'org.junit.jupiter:junit-jupiter'
     testRuntimeOnly 'org.junit.platform:junit-platform-launcher'
-    testRuntimeOnly files(providers.gradleProperty('diegesisDevJar').getOrElse('../diegesis-1.21.11/build/devlibs/diegesis-fabric-1.21.11-1.0.0-beta.11-port.1-dev.jar'))
+    testImplementation files(providers.gradleProperty('diegesisDevJar').getOrElse('../diegesis-1.21.11/build/devlibs/diegesis-fabric-1.21.11-1.0.0-beta.11-port.1-dev.jar'))
 }
 test { useJUnitPlatform() }
